@@ -345,7 +345,6 @@ async def save_config(request: ConfigUpdateRequest):
     except Exception as e:
         logger.error("Failed to save config: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
-        
     return {"status": "success", "message": "Configuration saved"}
 
 

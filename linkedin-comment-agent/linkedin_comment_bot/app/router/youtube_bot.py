@@ -506,6 +506,12 @@ comment_service = CommentService()
 # 7. LLM & Spintax Generator (ReplyGenerator)
 # ──────────────────────────────────────────────────────────────────────
 
+# Groq model used specifically for unmatched-comment AI fallback replies
+GROQ_FALLBACK_MODEL = "qwen/qwen3.6-27b"
+# Hardcoded Groq API key for fallback (can also be set via GROQ_API_KEY env var)
+_GROQ_FALLBACK_API_KEY = None
+
+
 class ReplyGenerator:
     def __init__(self):
         self.predefined_keywords = {
@@ -521,7 +527,9 @@ class ReplyGenerator:
         self.default_reply = "Thank you for your support."
         self.sheet_rules: Dict[str, Dict[str, str]] = {}
         self.client = None
+        self.groq_client = None  # Dedicated Groq client for AI fallback replies
         self._init_llm_client()
+        self._init_groq_fallback_client()
 
     async def fetch_sheet_rules(self) -> None:
         """Fetches the auto-reply rules CSV dynamically from the public Google Sheet."""
@@ -550,19 +558,62 @@ class ReplyGenerator:
                     return
 
                 csv_data = response.text
-                reader = csv.reader(csv_data.splitlines())
-                header = next(reader, None)
-                if not header:
+                all_rows = list(csv.reader(csv_data.splitlines()))
+
+                if not all_rows:
                     logger.warning("Google Sheet rules CSV is empty.")
                     return
 
+                # Debug: log first 3 raw rows to help diagnose parsing issues
+                for i, row in enumerate(all_rows[:3]):
+                    logger.info(f"  CSV row {i+1}: {row}")
+
+                # ── Auto-detect the real header row ───────────────────────────────
+                # Some sheets have a decorative title/banner row before the actual
+                # column headers. We scan up to the first 5 rows and pick the one
+                # that contains the most recognizable column-header keywords.
+                HEADER_KEYWORDS = {"url", "comment", "keyword", "reply", "message", "video", "title"}
+                header_row_idx = 0
+                best_score = 0
+                for i, row in enumerate(all_rows[:5]):
+                    score = sum(
+                        1 for cell in row
+                        if any(kw in cell.strip().lower() for kw in HEADER_KEYWORDS)
+                    )
+                    logger.info(f"  Header-candidate row {i}: score={score}, cells={row[:4]}")
+                    if score > best_score:
+                        best_score = score
+                        header_row_idx = i
+
+                header = all_rows[header_row_idx]
+                data_rows = all_rows[header_row_idx + 1:]
+                logger.info(f"Using row {header_row_idx} as header: {header}")
+
                 col_indices = {col.strip().lower(): idx for idx, col in enumerate(header)}
-                video_idx = next((idx for name, idx in col_indices.items() if name in ("video url", "url", "video_url") or "url" in name), 1)
-                comment_idx = next((idx for name, idx in col_indices.items() if name in ("comment text (keyword)", "comment text", "keyword", "user_comment", "user comment", "comment") or "keyword" in name or "comment" in name), 2)
-                reply_idx = next((idx for name, idx in col_indices.items() if name in ("reply message", "reply", "message", "reply_text") or "reply" in name or "message" in name), 3)
+                logger.info(f"Detected column indices: {col_indices}")
+
+                video_idx = next(
+                    (idx for name, idx in col_indices.items()
+                     if name in ("video url", "url", "video_url") or "url" in name),
+                    1
+                )
+                comment_idx = next(
+                    (idx for name, idx in col_indices.items()
+                     if name in ("comment text (keyword)", "comment text", "keyword",
+                                 "user_comment", "user comment", "comment")
+                     or "keyword" in name or "comment" in name),
+                    2
+                )
+                reply_idx = next(
+                    (idx for name, idx in col_indices.items()
+                     if name in ("reply message", "reply", "message", "reply_text")
+                     or "reply" in name or "message" in name),
+                    3
+                )
+                logger.info(f"Column mapping → video_idx={video_idx}, comment_idx={comment_idx}, reply_idx={reply_idx}")
 
                 rules = {}
-                for row in reader:
+                for row in data_rows:
                     if len(row) <= max(video_idx, comment_idx, reply_idx):
                         continue
                     video_url = row[video_idx].strip()
@@ -609,6 +660,73 @@ class ReplyGenerator:
         except Exception as e:
             logger.error(f"Failed to initialize LLM client: {str(e)}")
             self.client = None
+
+    def _init_groq_fallback_client(self):
+        """Initializes a dedicated Groq client used for AI fallback replies on unmatched comments.
+        This operates independently of the primary LLM provider configured in settings."""
+        groq_key = settings.GROQ_API_KEY or _GROQ_FALLBACK_API_KEY
+        if not groq_key:
+            logger.warning("No Groq API key found. Unmatched comments will not receive AI replies.")
+            return
+        try:
+            self.groq_client = AsyncOpenAI(
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1"
+            )
+            logger.info(f"Initialized Groq fallback client (model: {GROQ_FALLBACK_MODEL}) for unmatched-comment AI replies.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Groq fallback client: {str(e)}")
+            self.groq_client = None
+
+    async def generate_groq_fallback_reply(self, comment_text: str) -> str:
+        """Generates a contextual AI reply using Groq for comments that don't match any
+        keyword in the Google Sheet. Falls back to the default reply on any error."""
+        if not self.groq_client:
+            logger.warning("Groq fallback client not available. Using default reply.")
+            return self.default_reply
+
+        system_prompt = (
+            "You are the owner of a YouTube channel.\n"
+            "A viewer has left a comment that doesn't match any of your standard reply templates.\n"
+            "Read and understand the comment carefully, then write a friendly, helpful, and contextually "
+            "appropriate reply as the channel owner.\n"
+            "Constraints:\n"
+            "- Maximum 1-2 lines. Keep it very short and concise.\n"
+            "- Never argue or use offensive language.\n"
+            "- Keep the reply friendly, genuine, and conversational.\n"
+            "- ALWAYS reply in English, regardless of the language used in the comment.\n"
+            "- Address the specific question or point the commenter raised.\n"
+            "- Return ONLY the direct reply text — no quotes, no introduction, no metadata."
+        )
+
+        try:
+            response = await self.groq_client.chat.completions.create(
+                model=GROQ_FALLBACK_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": comment_text}
+                ],
+                max_tokens=1024,
+                temperature=0.75
+            )
+            reply = response.choices[0].message.content.strip()
+            # Strip reasoning blocks like <think>...</think> even if unclosed
+            reply = re.sub(r'<think>.*?(?:</think>|$)', '', reply, flags=re.DOTALL).strip()
+            
+            if not reply:
+                logger.warning("Groq AI fallback returned empty reply after stripping <think> tags. Using default.")
+                return self.default_reply
+                
+            # Strip any stray wrapping quotes the model may add
+            if reply.startswith('"') and reply.endswith('"'):
+                reply = reply[1:-1].strip()
+            if reply.startswith("'") and reply.endswith("'"):
+                reply = reply[1:-1].strip()
+            logger.info(f"Groq AI fallback generated reply: '{reply[:60]}...'")
+            return reply
+        except Exception as e:
+            logger.error(f"Groq AI fallback reply generation failed: {str(e)}. Using default reply.")
+            return self.default_reply
 
     def detect_sentiment_and_type(self, text: str) -> Tuple[str, bool, bool]:
         text_lower = text.lower()
@@ -659,11 +777,11 @@ class ReplyGenerator:
             "You are the owner of this YouTube channel.\n"
             "Reply professionally and politely to the following comment.\n"
             "Constraints:\n"
-            "- Maximum 40 words.\n"
+            "- Maximum 1-2 lines. Keep it very short and concise.\n"
             "- Never argue.\n"
             "- Never use offensive language.\n"
             "- Keep replies friendly and support-oriented.\n"
-            "- Reply in the same language as the commenter's comment.\n"
+            "- ALWAYS reply in English, regardless of the language used in the comment.\n"
             "- Return ONLY the direct reply text, with no wrapping quotes, no introduction, and no extra text."
         )
 
@@ -1304,12 +1422,21 @@ class YouTubeService:
         await reply_generator.fetch_sheet_rules()
 
         if not reply_generator.sheet_rules:
-            self.is_running = False
-            logger.error("No rules found in Google Sheet. Nothing to process.")
-            return {"status": "error", "message": "No rules found in Google Sheet"}
+            logger.warning(
+                "No keyword rules found in Google Sheet. "
+                "Bot will proceed using Groq AI fallback for ALL unmatched comments."
+            )
 
-        video_ids = list(reply_generator.sheet_rules.keys())
+        video_ids = list(reply_generator.sheet_rules.keys()) if reply_generator.sheet_rules else []
         logger.info(f"Loaded rules for {len(video_ids)} video(s): {video_ids}")
+
+        # If the sheet has no rules we cannot iterate per-video; scan a generic target list.
+        # For now, if sheet is completely empty we still need at least one video to process.
+        # The bot will process all videos found in the sheet; if the sheet is empty it exits gracefully.
+        if not video_ids:
+            logger.warning("Sheet rules are empty and no video IDs to iterate over. Cannot proceed without at least one video URL in the sheet.")
+            self.is_running = False
+            return {"status": "warning", "message": "No video URLs found in the Google Sheet. Add video URLs to enable AI fallback processing."}
 
         stats = {
             "total_comments": 0,
@@ -1429,8 +1556,18 @@ class YouTubeService:
                             logger.info("    -> Skipped (offensive)")
                             stats["skipped"] += 1
                             continue
-
-                    if matched_reply:
+                        # No keyword match and not offensive → queue for Groq AI fallback reply
+                        logger.info("    -> No keyword match. Will use Groq AI to generate a contextual reply.")
+                        matching_comments.append({
+                            "index": i,
+                            "thread": thread,
+                            "author": author,
+                            "text": text_normalized,
+                            "comment_id": comment_id,
+                            "reply_text": None,   # None signals AI-generated reply
+                            "ai_fallback": True,
+                        })
+                    else:
                         matching_comments.append({
                             "index": i,
                             "thread": thread,
@@ -1438,6 +1575,7 @@ class YouTubeService:
                             "text": text_normalized,
                             "comment_id": comment_id,
                             "reply_text": matched_reply,
+                            "ai_fallback": False,
                         })
 
                 logger.info(f"Scan complete: {len(matching_comments)} comment(s) match keyword rules.")
@@ -1453,8 +1591,14 @@ class YouTubeService:
                     comment_id = item["comment_id"]
                     reply_text = item["reply_text"]
                     thread = item["thread"]
+                    ai_fallback = item.get("ai_fallback", False)
 
-                    humanized_reply = await reply_generator.humanize_static_reply(text, reply_text, author)
+                    if ai_fallback:
+                        # Generate a fresh Groq AI reply for this unmatched comment
+                        logger.info(f"Generating Groq AI fallback reply for comment by '{author}'...")
+                        humanized_reply = await reply_generator.generate_groq_fallback_reply(text)
+                    else:
+                        humanized_reply = await reply_generator.humanize_static_reply(text, reply_text, author)
                     logger.info(f"Replying to '{author}': '{text[:50]}...' with: '{humanized_reply[:50]}...'")
 
                     success = await self.post_reply(page, thread, humanized_reply)
