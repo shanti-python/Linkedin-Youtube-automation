@@ -7,6 +7,12 @@ import os
 import sys
 from pathlib import Path
 
+# Force Qt applications (and browsers using Qt integrations) to use X11/XWayland
+# to prevent crashes on Gnome Wayland when the Qt wayland plugin is missing.
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+os.environ["XDG_SESSION_TYPE"] = "x11"
+os.environ.pop("WAYLAND_DISPLAY", None)
+
 # Initialize Playwright browser path at the very beginning if running as a compiled PyInstaller executable
 if getattr(sys, "frozen", False):
     if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ:

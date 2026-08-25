@@ -6,6 +6,12 @@ and FastAPI web routes for the automated Shorts comment reply system.
 """
 
 import os
+# Force Qt applications (and browsers using Qt integrations) to use X11/XWayland
+# to prevent crashes on Gnome Wayland when the Qt wayland plugin is missing.
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+os.environ["XDG_SESSION_TYPE"] = "x11"
+os.environ.pop("WAYLAND_DISPLAY", None)
+
 import sys
 import re
 import csv
@@ -285,7 +291,8 @@ class BrowserManager:
             "--no-sandbox",
             "--disable-infobars",
             "--disable-dev-shm-usage",
-            "--disable-gpu"
+            "--disable-gpu",
+            "--ozone-platform=x11"
         ]
         
         logger.info(f"Launching persistent Chromium context (Headless: {settings.HEADLESS})...")
@@ -925,7 +932,14 @@ class YouTubeService:
         try:
             if await avatar.count() > 0:
                 logger.info("User is already signed in to YouTube.")
-                return True
+                logger.info("Pausing for 25 seconds to allow you to switch accounts in the browser window if this is not the correct account...")
+                for remaining in range(25, 0, -5):
+                    logger.info(f"Continuing in {remaining} seconds...")
+                    await asyncio.sleep(5.0)
+                # Re-verify sign-in status after the wait
+                if await avatar.count() > 0:
+                    logger.info("Proceeding with the currently logged-in account.")
+                    return True
         except Exception:
             pass
 
@@ -933,7 +947,7 @@ class YouTubeService:
         logger.info("Please sign in to your Google Account in the opened browser window.")
         await page.goto("https://accounts.google.com/ServiceLogin?service=youtube", wait_until="domcontentloaded")
 
-        max_wait = 120
+        max_wait = 300
         poll_interval = 3
         waited = 0
 
@@ -946,7 +960,7 @@ class YouTubeService:
                 await page.wait_for_load_state("networkidle")
                 return True
 
-        logger.error("Sign-in timeout exceeded (120s). Stopping automation.")
+        logger.error("Sign-in timeout exceeded (300s). Stopping automation.")
         return False
 
     async def goto_shorts(self, page: Page, video_id: str) -> bool:
@@ -1429,8 +1443,21 @@ class YouTubeService:
                             logger.info("    -> Skipped (offensive)")
                             stats["skipped"] += 1
                             continue
-
-                    if matched_reply:
+                        # No keyword match and not offensive -> requires manual review
+                        logger.info(f"    -> [MANUAL REVIEW REQUIRED] Comment by '{author}' requires a manual reply: '{text_normalized}'")
+                        comment_service.mark_processed(video_id, comment_id)
+                        comment_service.save_log(
+                            video_id=video_id,
+                            comment_id=comment_id,
+                            author=author,
+                            comment=text_normalized,
+                            generated_reply=None,
+                            status="manual_review",
+                            reason="No matching keyword. Requires manual review."
+                        )
+                        stats["skipped"] += 1
+                        continue
+                    else:
                         matching_comments.append({
                             "index": i,
                             "thread": thread,

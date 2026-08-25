@@ -6,6 +6,12 @@ and FastAPI web routes for the automated Shorts comment reply system.
 """
 
 import os
+# Force Qt applications (and browsers using Qt integrations) to use X11/XWayland
+# to prevent crashes on Gnome Wayland when the Qt wayland plugin is missing.
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+os.environ["XDG_SESSION_TYPE"] = "x11"
+os.environ.pop("WAYLAND_DISPLAY", None)
+
 import sys
 import re
 import csv
@@ -285,7 +291,8 @@ class BrowserManager:
             "--no-sandbox",
             "--disable-infobars",
             "--disable-dev-shm-usage",
-            "--disable-gpu"
+            "--disable-gpu",
+            "--ozone-platform=x11"
         ]
         
         logger.info(f"Launching persistent Chromium context (Headless: {settings.HEADLESS})...")
@@ -550,19 +557,62 @@ class ReplyGenerator:
                     return
 
                 csv_data = response.text
-                reader = csv.reader(csv_data.splitlines())
-                header = next(reader, None)
-                if not header:
+                all_rows = list(csv.reader(csv_data.splitlines()))
+
+                if not all_rows:
                     logger.warning("Google Sheet rules CSV is empty.")
                     return
 
+                # Debug: log first 3 raw rows to help diagnose parsing issues
+                for i, row in enumerate(all_rows[:3]):
+                    logger.info(f"  CSV row {i+1}: {row}")
+
+                # ── Auto-detect the real header row ───────────────────────────────
+                # Some sheets have a decorative title/banner row before the actual
+                # column headers. We scan up to the first 5 rows and pick the one
+                # that contains the most recognizable column-header keywords.
+                HEADER_KEYWORDS = {"url", "comment", "keyword", "reply", "message", "video", "title"}
+                header_row_idx = 0
+                best_score = 0
+                for i, row in enumerate(all_rows[:5]):
+                    score = sum(
+                        1 for cell in row
+                        if any(kw in cell.strip().lower() for kw in HEADER_KEYWORDS)
+                    )
+                    logger.info(f"  Header-candidate row {i}: score={score}, cells={row[:4]}")
+                    if score > best_score:
+                        best_score = score
+                        header_row_idx = i
+
+                header = all_rows[header_row_idx]
+                data_rows = all_rows[header_row_idx + 1:]
+                logger.info(f"Using row {header_row_idx} as header: {header}")
+
                 col_indices = {col.strip().lower(): idx for idx, col in enumerate(header)}
-                video_idx = next((idx for name, idx in col_indices.items() if name in ("video url", "url", "video_url") or "url" in name), 1)
-                comment_idx = next((idx for name, idx in col_indices.items() if name in ("comment text (keyword)", "comment text", "keyword", "user_comment", "user comment", "comment") or "keyword" in name or "comment" in name), 2)
-                reply_idx = next((idx for name, idx in col_indices.items() if name in ("reply message", "reply", "message", "reply_text") or "reply" in name or "message" in name), 3)
+                logger.info(f"Detected column indices: {col_indices}")
+
+                video_idx = next(
+                    (idx for name, idx in col_indices.items()
+                     if name in ("video url", "url", "video_url") or "url" in name),
+                    1
+                )
+                comment_idx = next(
+                    (idx for name, idx in col_indices.items()
+                     if name in ("comment text (keyword)", "comment text", "keyword",
+                                 "user_comment", "user comment", "comment")
+                     or "keyword" in name or "comment" in name),
+                    2
+                )
+                reply_idx = next(
+                    (idx for name, idx in col_indices.items()
+                     if name in ("reply message", "reply", "message", "reply_text")
+                     or "reply" in name or "message" in name),
+                    3
+                )
+                logger.info(f"Column mapping → video_idx={video_idx}, comment_idx={comment_idx}, reply_idx={reply_idx}")
 
                 rules = {}
-                for row in reader:
+                for row in data_rows:
                     if len(row) <= max(video_idx, comment_idx, reply_idx):
                         continue
                     video_url = row[video_idx].strip()
@@ -659,11 +709,11 @@ class ReplyGenerator:
             "You are the owner of this YouTube channel.\n"
             "Reply professionally and politely to the following comment.\n"
             "Constraints:\n"
-            "- Maximum 40 words.\n"
+            "- Maximum 1-2 lines. Keep it very short and concise.\n"
             "- Never argue.\n"
             "- Never use offensive language.\n"
             "- Keep replies friendly and support-oriented.\n"
-            "- Reply in the same language as the commenter's comment.\n"
+            "- ALWAYS reply in English, regardless of the language used in the comment.\n"
             "- Return ONLY the direct reply text, with no wrapping quotes, no introduction, and no extra text."
         )
 
@@ -925,7 +975,14 @@ class YouTubeService:
         try:
             if await avatar.count() > 0:
                 logger.info("User is already signed in to YouTube.")
-                return True
+                logger.info("Pausing for 25 seconds to allow you to switch accounts in the browser window if this is not the correct account...")
+                for remaining in range(25, 0, -5):
+                    logger.info(f"Continuing in {remaining} seconds...")
+                    await asyncio.sleep(5.0)
+                # Re-verify sign-in status after the wait
+                if await avatar.count() > 0:
+                    logger.info("Proceeding with the currently logged-in account.")
+                    return True
         except Exception:
             pass
 
@@ -933,7 +990,7 @@ class YouTubeService:
         logger.info("Please sign in to your Google Account in the opened browser window.")
         await page.goto("https://accounts.google.com/ServiceLogin?service=youtube", wait_until="domcontentloaded")
 
-        max_wait = 120
+        max_wait = 300
         poll_interval = 3
         waited = 0
 
@@ -946,7 +1003,7 @@ class YouTubeService:
                 await page.wait_for_load_state("networkidle")
                 return True
 
-        logger.error("Sign-in timeout exceeded (120s). Stopping automation.")
+        logger.error("Sign-in timeout exceeded (300s). Stopping automation.")
         return False
 
     async def goto_shorts(self, page: Page, video_id: str) -> bool:
@@ -1302,14 +1359,16 @@ class YouTubeService:
         """Main orchestrator to process all videos and matching comments."""
         self.is_running = True
         await reply_generator.fetch_sheet_rules()
-
         if not reply_generator.sheet_rules:
-            self.is_running = False
-            logger.error("No rules found in Google Sheet. Nothing to process.")
-            return {"status": "error", "message": "No rules found in Google Sheet"}
+            logger.warning("No keyword rules found in Google Sheet.")
 
-        video_ids = list(reply_generator.sheet_rules.keys())
+        video_ids = list(reply_generator.sheet_rules.keys()) if reply_generator.sheet_rules else []
         logger.info(f"Loaded rules for {len(video_ids)} video(s): {video_ids}")
+
+        if not video_ids:
+            logger.warning("Sheet rules are empty. No video URLs found in the Google sheet.")
+            self.is_running = False
+            return {"status": "warning", "message": "No video URLs found in the Google Sheet."}
 
         stats = {
             "total_comments": 0,
@@ -1429,8 +1488,21 @@ class YouTubeService:
                             logger.info("    -> Skipped (offensive)")
                             stats["skipped"] += 1
                             continue
-
-                    if matched_reply:
+                        # No keyword match and not offensive -> requires manual review
+                        logger.info(f"    -> [MANUAL REVIEW REQUIRED] Comment by '{author}' requires a manual reply: '{text_normalized}'")
+                        comment_service.mark_processed(video_id, comment_id)
+                        comment_service.save_log(
+                            video_id=video_id,
+                            comment_id=comment_id,
+                            author=author,
+                            comment=text_normalized,
+                            generated_reply=None,
+                            status="manual_review",
+                            reason="No matching keyword. Requires manual review."
+                        )
+                        stats["skipped"] += 1
+                        continue
+                    else:
                         matching_comments.append({
                             "index": i,
                             "thread": thread,
@@ -1453,7 +1525,6 @@ class YouTubeService:
                     comment_id = item["comment_id"]
                     reply_text = item["reply_text"]
                     thread = item["thread"]
-
                     humanized_reply = await reply_generator.humanize_static_reply(text, reply_text, author)
                     logger.info(f"Replying to '{author}': '{text[:50]}...' with: '{humanized_reply[:50]}...'")
 

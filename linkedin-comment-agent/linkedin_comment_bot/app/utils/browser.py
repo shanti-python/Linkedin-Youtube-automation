@@ -1,5 +1,12 @@
 """Playwright browser lifecycle management with persistent Chrome profile."""
 
+import os
+# Force Qt applications (and browsers using Qt integrations) to use X11/XWayland
+# to prevent crashes on Gnome Wayland when the Qt wayland plugin is missing.
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+os.environ["XDG_SESSION_TYPE"] = "x11"
+os.environ.pop("WAYLAND_DISPLAY", None)
+
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
 
@@ -54,6 +61,7 @@ class BrowserManager:
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--ozone-platform=x11",
             ],
             "ignore_default_args": ["--enable-automation"],
         }

@@ -1,4 +1,10 @@
 import os
+# Force Qt applications (and browsers using Qt integrations) to use X11/XWayland
+# to prevent crashes on Gnome Wayland when the Qt wayland plugin is missing.
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+os.environ["XDG_SESSION_TYPE"] = "x11"
+os.environ.pop("WAYLAND_DISPLAY", None)
+
 from typing import Tuple
 from playwright.async_api import async_playwright, Playwright, BrowserContext, Page
 from playwright_stealth import Stealth
@@ -40,7 +46,8 @@ class BrowserManager:
             "--no-sandbox",
             "--disable-infobars",
             "--disable-dev-shm-usage",
-            "--disable-gpu"
+            "--disable-gpu",
+            "--ozone-platform=x11"
         ]
         
         logger.info(f"Launching persistent Chromium context (Headless: {settings.HEADLESS})...")
