@@ -54,14 +54,14 @@ export default function Home() {
   const [accountFilter, setAccountFilter] = useState<string>("all");
   const [postFilter, setPostFilter] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState<string>("");
-  
+
   // Configuration Settings State
   const [configSettings, setConfigSettings] = useState<Record<string, any>>({});
   const [isSavingConfig, setIsSavingConfig] = useState<boolean>(false);
   const [saveStatus, setSaveStatus] = useState<{ success: boolean; msg: string } | null>(null);
   const [isStartingBot, setIsStartingBot] = useState<boolean>(false);
   const [isClearingLogs, setIsClearingLogs] = useState<boolean>(false);
-  
+
   // Toast notifications state
   const [toasts, setToasts] = useState<Toast[]>([]);
 
@@ -75,7 +75,7 @@ export default function Home() {
     isOpen: false,
     title: "",
     message: "",
-    onConfirm: () => {},
+    onConfirm: () => { },
   });
 
   // Console logs auto-scroll
@@ -95,7 +95,7 @@ export default function Home() {
   const fetchData = async () => {
     try {
       const apiUrl = getApiUrl();
-      
+
       // 1. Fetch Status
       const statusRes = await fetch(`${apiUrl}/${platform}/comment/status`);
       if (statusRes.ok) {
@@ -151,7 +151,7 @@ export default function Home() {
         if (dateFilter === "today") limitDate.setHours(0, 0, 0, 0);
         else if (dateFilter === "week") limitDate.setDate(limitDate.getDate() - 7);
         else if (dateFilter === "month") limitDate.setDate(limitDate.getDate() - 30);
-        
+
         if (!l.timestamp) return false;
         return new Date(l.timestamp) >= limitDate;
       }
@@ -200,7 +200,7 @@ export default function Home() {
       // Group by 4-hour intervals for today (6 bars)
       const now = new Date();
       now.setHours(0, 0, 0, 0); // start of today
-      
+
       labels = ["00:00", "04:00", "08:00", "12:00", "16:00", "20:00"];
       values = [0, 0, 0, 0, 0, 0];
 
@@ -310,14 +310,31 @@ export default function Home() {
     setIsStartingBot(true);
     try {
       const apiUrl = getApiUrl();
+
+      // Persist current settings (such as Google Sheet Rules URL) to backend before starting
+      if (Object.keys(configSettings).length > 0) {
+        try {
+          await fetch(`${apiUrl}/${platform}/config/save`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ settings: configSettings }),
+          });
+        } catch (saveErr) {
+          console.warn("Could not pre-save settings before starting bot:", saveErr);
+        }
+      }
+
       const res = await fetch(`${apiUrl}/${platform}/comment/start`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings: configSettings }),
       });
       if (res.ok) {
         showToast("Bot automation started successfully!", "success");
         fetchData();
       } else {
-        showToast("Failed to start bot. Check settings or credentials.", "error");
+        const errData = await res.json().catch(() => ({}));
+        showToast(errData.detail || "Failed to start bot. Check settings or credentials.", "error");
       }
     } catch (err) {
       showToast("Error contacting API: " + err, "error");
@@ -410,10 +427,10 @@ export default function Home() {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#0f111a] text-slate-100 font-sans">
-      
+
       {/* LEFT SIDEBAR NAVIGATION */}
       <aside className="w-72 bg-[#161925] flex flex-col border-r border-slate-800">
-        
+
         {/* Branding header */}
         <div className="p-5 border-b border-slate-800">
           <div className="flex items-center gap-3 mb-4">
@@ -432,28 +449,26 @@ export default function Home() {
           <div className="flex rounded-lg overflow-hidden border border-slate-700 text-xs font-bold">
             <button
               onClick={() => { setPlatform("linkedin"); setConfigSettings({}); setStatus(null); }}
-              className={`flex-1 py-2 flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                platform === "linkedin"
+              className={`flex-1 py-2 flex items-center justify-center gap-1.5 transition-all cursor-pointer ${platform === "linkedin"
                   ? "bg-indigo-600 text-white"
                   : "bg-[#0f111a] text-slate-400 hover:text-white hover:bg-slate-800"
-              }`}
+                }`}
             >
               <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M16 8a6 6 0 016 6v7h-4v-7a2 2 0 00-2-2 2 2 0 00-2 2v7h-4v-7a6 6 0 016-6zM2 9h4v12H2z"/>
-                <circle cx="4" cy="4" r="2"/>
+                <path d="M16 8a6 6 0 016 6v7h-4v-7a2 2 0 00-2-2 2 2 0 00-2 2v7h-4v-7a6 6 0 016-6zM2 9h4v12H2z" />
+                <circle cx="4" cy="4" r="2" />
               </svg>
               LinkedIn
             </button>
             <button
               onClick={() => { setPlatform("youtube"); setConfigSettings({}); setStatus(null); }}
-              className={`flex-1 py-2 flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                platform === "youtube"
+              className={`flex-1 py-2 flex items-center justify-center gap-1.5 transition-all cursor-pointer ${platform === "youtube"
                   ? "bg-red-600 text-white"
                   : "bg-[#0f111a] text-slate-400 hover:text-white hover:bg-slate-800"
-              }`}
+                }`}
             >
               <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M23.495 6.205a3.007 3.007 0 00-2.088-2.088c-1.87-.501-9.396-.501-9.396-.501s-7.507-.01-9.396.501A3.007 3.007 0 00.527 6.205a31.247 31.247 0 00-.522 5.805 31.247 31.247 0 00.522 5.783 3.007 3.007 0 002.088 2.088c1.868.502 9.396.502 9.396.502s7.506 0 9.396-.502a3.007 3.007 0 002.088-2.088 31.247 31.247 0 00.5-5.783 31.247 31.247 0 00-.5-5.805zM9.609 15.601V8.408l6.264 3.602z"/>
+                <path d="M23.495 6.205a3.007 3.007 0 00-2.088-2.088c-1.87-.501-9.396-.501-9.396-.501s-7.507-.01-9.396.501A3.007 3.007 0 00.527 6.205a31.247 31.247 0 00-.522 5.805 31.247 31.247 0 00.522 5.783 3.007 3.007 0 002.088 2.088c1.868.502 9.396.502 9.396.502s7.506 0 9.396-.502a3.007 3.007 0 002.088-2.088 31.247 31.247 0 00.5-5.783 31.247 31.247 0 00-.5-5.805zM9.609 15.601V8.408l6.264 3.602z" />
               </svg>
               YouTube
             </button>
@@ -468,7 +483,7 @@ export default function Home() {
               {(!isApiConnected) ? "DISCONNECTED" : (status?.is_processing ? "● RUNNING" : "● IDLE")}
             </div>
           </div>
-          
+
           <div className="text-xs text-slate-400 break-words leading-relaxed min-h-[36px]">
             {(!isApiConnected) ? (
               <span className="text-red-400">Cannot reach backend API. Make sure uvicorn is running.</span>
@@ -490,12 +505,12 @@ export default function Home() {
               <div>
                 {platform === "linkedin" ? (
                   <>Target: <strong className="text-emerald-400">Account posts scan</strong>
-                  {configSettings.max_days && (
-                    <span className="block text-[10px] text-slate-500 mt-1">Filters: Past {configSettings.max_days} days</span>
-                  )}</>
+                    {configSettings.max_days && (
+                      <span className="block text-[10px] text-slate-500 mt-1">Filters: Past {configSettings.max_days} days</span>
+                    )}</>
                 ) : (
                   <>Target: <strong className="text-red-400">YouTube Shorts</strong>
-                  <span className="block text-[10px] text-slate-500 mt-1">Keyword-based auto-reply</span></>
+                    <span className="block text-[10px] text-slate-500 mt-1">Keyword-based auto-reply</span></>
                 )}
               </div>
             )}
@@ -506,11 +521,10 @@ export default function Home() {
         <nav className="flex-1 px-4 space-y-1">
           <button
             onClick={() => setActiveTab("dashboard")}
-            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-semibold transition-all cursor-pointer ${
-              activeTab === "dashboard"
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-semibold transition-all cursor-pointer ${activeTab === "dashboard"
                 ? platform === "youtube" ? "bg-red-600 text-white shadow-md shadow-red-600/20" : "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
                 : "text-slate-400 hover:bg-slate-800 hover:text-white"
-            }`}
+              }`}
           >
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2H6a2 2 0 01-2-2v-4zM14 16a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2h-2a2 2 0 01-2-2v-4z" />
@@ -520,11 +534,10 @@ export default function Home() {
 
           <button
             onClick={() => setActiveTab("logs")}
-            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-semibold transition-all cursor-pointer ${
-              activeTab === "logs"
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-semibold transition-all cursor-pointer ${activeTab === "logs"
                 ? platform === "youtube" ? "bg-red-600 text-white shadow-md shadow-red-600/20" : "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
                 : "text-slate-400 hover:bg-slate-800 hover:text-white"
-            }`}
+              }`}
           >
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
@@ -536,22 +549,21 @@ export default function Home() {
 
       {/* MAIN CONTAINER */}
       <main className="flex-1 flex flex-col overflow-hidden bg-[#0b0c13]">
-        
+
         {/* HEADER BAR */}
         <header className="h-16 border-b border-slate-800 px-8 flex justify-between items-center bg-[#10121d]">
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-bold text-white uppercase tracking-wider">
               Automation Dashboard
             </h2>
-            <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border ${
-              platform === "youtube"
+            <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border ${platform === "youtube"
                 ? "bg-red-500/15 text-red-400 border-red-500/25"
                 : "bg-indigo-500/15 text-indigo-400 border-indigo-500/25"
-            }`}>
+              }`}>
               {platform === "youtube" ? "YouTube" : "LinkedIn"}
             </span>
           </div>
-          
+
           <div className="flex items-center gap-4">
             <div className={`w-1.5 h-1.5 rounded-full animate-ping ${platform === "youtube" ? "bg-red-500" : "bg-emerald-500"}`}></div>
           </div>
@@ -559,11 +571,11 @@ export default function Home() {
 
         {/* TAB CONTENTS SCROLLABLE VIEW */}
         <div className="flex-1 overflow-y-auto p-8">
-          
+
           {/* TAB 1: DASHBOARD */}
           {activeTab === "dashboard" && (
             <div className="space-y-8 max-w-7xl mx-auto">
-              
+
               {/* GLOBAL DATE FILTER COMPONENT */}
               <div className="flex justify-between items-center bg-[#151824] p-4 rounded-xl border border-slate-800/80 shadow-sm">
                 <div className="flex items-center gap-3">
@@ -583,7 +595,7 @@ export default function Home() {
 
               {/* TOP STATS CARDS GRID */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                
+
                 <div className="bg-[#151824] rounded-2xl p-6 border border-slate-800/80 shadow-md">
                   <div className="flex justify-between items-center">
                     <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Replies Today</span>
@@ -649,11 +661,10 @@ export default function Home() {
 
                 <form onSubmit={handleSaveConfig} className="space-y-6">
                   {saveStatus && (
-                    <div className={`p-4 rounded-xl border text-xs font-semibold ${
-                      saveStatus.success
+                    <div className={`p-4 rounded-xl border text-xs font-semibold ${saveStatus.success
                         ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
                         : "bg-rose-500/10 text-rose-400 border-rose-500/20"
-                    }`}>
+                      }`}>
                       {saveStatus.msg}
                     </div>
                   )}
@@ -807,11 +818,11 @@ export default function Home() {
                 <h3 className="text-sm font-bold text-white uppercase tracking-wider mb-6">
                   Comment Activity ({
                     dateFilter === "today" ? "Today" :
-                    dateFilter === "week" ? "Past 7 Days" :
-                    dateFilter === "month" ? "Past 30 Days" : "All Time"
+                      dateFilter === "week" ? "Past 7 Days" :
+                        dateFilter === "month" ? "Past 30 Days" : "All Time"
                   })
                 </h3>
-                
+
                 <div className="min-h-[220px] relative">
                   <svg viewBox="0 0 500 220" className="w-full h-full">
                     <line x1="40" y1="20" x2="480" y2="20" stroke="#1f2937" strokeDasharray="3" />
@@ -873,10 +884,10 @@ export default function Home() {
 
               {/* ROW 4: TIMELINE OF COMMENT LOGS TABLE */}
               <div className="bg-[#151824] border border-slate-800/80 rounded-2xl p-6 shadow-md">
-                
+
                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
                   <h3 className="text-sm font-bold text-white uppercase tracking-wider">Comment Activity History</h3>
-                  
+
                   <div className="flex flex-wrap items-center gap-3">
                     <input
                       type="text"
@@ -949,13 +960,12 @@ export default function Home() {
                           </td>
                           <td className="py-3 px-4 whitespace-nowrap">
                             <span
-                              className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                                log.status === "replied"
+                              className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${log.status === "replied"
                                   ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
                                   : log.status === "skipped"
-                                  ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
-                                  : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
-                              }`}
+                                    ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                                    : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+                                }`}
                             >
                               {log.status}
                             </span>
@@ -987,10 +997,10 @@ export default function Home() {
           {/* TAB 2: LIVE LOGS */}
           {activeTab === "logs" && (
             <div className="max-w-6xl mx-auto flex flex-col h-[calc(100vh-12rem)]">
-              
+
               <div className="flex justify-between items-center mb-3">
                 <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Live System Logs tail</span>
-                
+
                 <div className="flex gap-2">
                   <button
                     onClick={fetchData}
@@ -1034,7 +1044,7 @@ export default function Home() {
       {selectedLog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
           <div className="w-full max-w-2xl bg-[#161925] border border-slate-800 rounded-2xl shadow-xl overflow-hidden flex flex-col">
-            
+
             <div className="px-6 py-4 border-b border-slate-800 flex justify-between items-center bg-[#1b1f2e]">
               <div>
                 <h3 className="font-bold text-white text-sm">Interaction Detail</h3>
@@ -1051,18 +1061,17 @@ export default function Home() {
             </div>
 
             <div className="p-6 space-y-4 overflow-y-auto max-h-[70vh] text-xs">
-              
+
               <div className="grid grid-cols-3 gap-4">
                 <div>
                   <span className="text-[10px] font-bold text-slate-500 uppercase block mb-1">Status</span>
                   <span
-                    className={`px-2.5 py-0.5 rounded text-[10px] font-bold uppercase inline-block ${
-                      selectedLog.status === "replied"
+                    className={`px-2.5 py-0.5 rounded text-[10px] font-bold uppercase inline-block ${selectedLog.status === "replied"
                         ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
                         : selectedLog.status === "skipped"
-                        ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
-                        : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
-                    }`}
+                          ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                          : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+                      }`}
                   >
                     {selectedLog.status}
                   </span>
@@ -1138,7 +1147,7 @@ export default function Home() {
       {confirmModal.isOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-md animate-fade-in">
           <div className="w-full max-w-md bg-[#161925] border border-slate-800/80 rounded-2xl shadow-2xl overflow-hidden flex flex-col p-6 animate-scale-up">
-            
+
             {/* Title Header with warning icon */}
             <div className="flex items-center gap-3 mb-4">
               <div className="p-2.5 bg-rose-500/10 rounded-xl text-rose-400">
@@ -1179,13 +1188,12 @@ export default function Home() {
         {toasts.map((toast) => (
           <div
             key={toast.id}
-            className={`p-4 rounded-xl border text-xs font-semibold shadow-xl flex items-center gap-3 pointer-events-auto animate-slide-in-right transition-all ${
-              toast.type === "success"
+            className={`p-4 rounded-xl border text-xs font-semibold shadow-xl flex items-center gap-3 pointer-events-auto animate-slide-in-right transition-all ${toast.type === "success"
                 ? "bg-emerald-950/80 text-emerald-400 border-emerald-500/30 backdrop-blur-md"
                 : toast.type === "error"
-                ? "bg-rose-955/80 text-rose-400 border-rose-500/30 backdrop-blur-md"
-                : "bg-indigo-950/80 text-indigo-400 border-indigo-500/30 backdrop-blur-md"
-            }`}
+                  ? "bg-rose-955/80 text-rose-400 border-rose-500/30 backdrop-blur-md"
+                  : "bg-indigo-950/80 text-indigo-400 border-indigo-500/30 backdrop-blur-md"
+              }`}
           >
             {toast.type === "success" && (
               <div className="p-1 rounded bg-emerald-500/10 text-emerald-400">

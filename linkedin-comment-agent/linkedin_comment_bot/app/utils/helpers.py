@@ -36,6 +36,14 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
+def strip_emojis(text: str) -> str:
+    """Removes emoji characters and symbols to ensure professional replies."""
+    if not text:
+        return ""
+    clean = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf\ufe00-\ufe0f]', '', text)
+    return re.sub(r' +', ' ', clean).strip()
+
+
 def comment_hash(author: str, text: str) -> str:
     payload = f"{normalize_text(author)}::{normalize_text(text)}"
     return hashlib.sha256(payload.encode()).hexdigest()[:16]

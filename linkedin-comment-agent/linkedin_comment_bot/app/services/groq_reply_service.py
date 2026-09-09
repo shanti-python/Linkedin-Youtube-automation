@@ -6,7 +6,7 @@ from typing import Optional
 from groq import Groq
 
 from linkedin_comment_bot.app.config import Settings, get_settings
-from linkedin_comment_bot.app.utils.helpers import detect_language_simple, is_question
+from linkedin_comment_bot.app.utils.helpers import detect_language_simple, is_question, strip_emojis
 from linkedin_comment_bot.app.utils.logger import get_logger
 
 logger = get_logger()
@@ -15,7 +15,7 @@ SYSTEM_PROMPT = """You are the owner of this LinkedIn account.
 Reply professionally.
 Maximum 60 words.
 Be friendly.
-Never use emojis unless appropriate.
+Never use any emojis.
 Never argue.
 Never discuss politics.
 Never generate offensive language.
@@ -66,7 +66,7 @@ Instructions:
 4. Generate a personalized and context-aware reply that directly matches the intent and addresses the content of the comment. Do NOT post generic, boilerplate, or robotic responses.
 5. Reply professionally, naturally, and in a friendly manner.
 6. Maximum length: 60 words.
-7. Do not use emojis unless they are highly appropriate.
+7. Do not use any emojis under any circumstances.
 8. Never argue, discuss politics, or generate offensive language.
 9. Output ONLY the reply text. Do not include any meta-text, introductions, quotes, or explanations."""
 
@@ -111,7 +111,7 @@ Instructions:
         )
 
         reply_text = (response.choices[0].message.content or "").strip()
-        reply_text = reply_text.strip('"').strip("'")
+        reply_text = strip_emojis(reply_text.strip('"').strip("'"))
 
         from linkedin_comment_bot.app.utils.helpers import analyze_sentiment_simple
 

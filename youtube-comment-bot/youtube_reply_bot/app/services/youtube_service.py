@@ -10,7 +10,7 @@ from youtube_reply_bot.app.utils.helpers import extract_video_id
 from youtube_reply_bot.app.utils.human_typing import (
     random_delay, human_type, human_click, human_scroll
 )
-from youtube_reply_bot.app.services.reply_generator import reply_generator
+from youtube_reply_bot.app.services.reply_generator import reply_generator, strip_emojis
 from youtube_reply_bot.app.services.comment_service import comment_service
 from youtube_reply_bot.app.utils.comment_publish import (
     dump_response_keys,
@@ -547,6 +547,7 @@ class YouTubeService:
 
     async def post_reply(self, page: Page, thread: Locator, reply_text: str, video_id: str = "") -> bool:
         """Clicks Reply on a comment, types the reply text, and verifies submission."""
+        reply_text = strip_emojis(reply_text)
         max_retries = 3
 
         for attempt in range(1, max_retries + 1):
@@ -834,7 +835,7 @@ class YouTubeService:
 
     # ─── Main Orchestrator ────────────────────────
 
-    async def run_auto_reply(self) -> Dict[str, Any]:
+    async def run_auto_reply(self, sheet_url: Optional[str] = None) -> Dict[str, Any]:
         """
         Main entry point. Reads rules from Google Sheet, navigates to each
         YouTube Short, opens comments, scans for keyword matches, and replies.
@@ -843,7 +844,7 @@ class YouTubeService:
         self.is_running = True
 
         # Step 1: Fetch rules from Google Sheet
-        await reply_generator.fetch_sheet_rules()
+        await reply_generator.fetch_sheet_rules(sheet_url=sheet_url)
 
         if not reply_generator.sheet_rules:
             self.is_running = False

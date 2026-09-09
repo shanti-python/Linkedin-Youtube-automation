@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     MAX_RANDOM_DELAY: float = 45.0
     MIN_WATCH_DELAY: float = 6.0
     MAX_WATCH_DELAY: float = 15.0
-    AUTO_REWRITE_REPLY: bool = True
+    AUTO_REWRITE_REPLY: bool = False
     
     # Data storage config
     CSV_PATH: str = "replies/replies_log.csv"
@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     # Google Sheets (Optional)
     GOOGLE_SHEET_ID: Optional[str] = None
     GOOGLE_SHEET_CREDENTIALS_FILE: Optional[str] = None
-    GOOGLE_SHEET_RULES_URL: str = "https://docs.google.com/spreadsheets/d/1bfT7e4GsiqbBPXV1UD7f5HioOa-N71Db/edit?gid=1122465407#gid=1122465407"
+    GOOGLE_SHEET_RULES_URL: Optional[str] = None
     
     # App root path resolver
     BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent

@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     MAX_RANDOM_DELAY: float = 45.0
     MIN_WATCH_DELAY: float = 6.0
     MAX_WATCH_DELAY: float = 15.0
-    AUTO_REWRITE_REPLY: bool = True
+    AUTO_REWRITE_REPLY: bool = False
     
     # Data storage config
     CSV_PATH: str = "replies/replies_log.csv"
@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     # Google Sheets (Optional)
     GOOGLE_SHEET_ID: Optional[str] = None
     GOOGLE_SHEET_CREDENTIALS_FILE: Optional[str] = None
-    GOOGLE_SHEET_RULES_URL: str = "https://docs.google.com/spreadsheets/d/1bfT7e4GsiqbBPXV1UD7f5HioOa-N71Db/edit?gid=1122465407#gid=1122465407"
+    GOOGLE_SHEET_RULES_URL: Optional[str] = None
     
     # App root path resolver - points to the linkedin-comment-agent project root (3 levels up from this file)
     BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent.parent
@@ -513,14 +513,22 @@ comment_service = CommentService()
 # 7. LLM & Spintax Generator (ReplyGenerator)
 # ──────────────────────────────────────────────────────────────────────
 
+def strip_emojis(text: str) -> str:
+    """Removes emoji characters and symbols from comment replies to keep comments professional."""
+    if not text:
+        return ""
+    clean = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf\ufe00-\ufe0f]', '', text)
+    return re.sub(r' +', ' ', clean).strip()
+
+
 class ReplyGenerator:
     def __init__(self):
         self.predefined_keywords = {
             "guide": "Thank you! I'll make a detailed guide soon.",
             "tutorial": "Thank you! I'll make a detailed guide soon.",
             "python": "Python tutorial is coming soon.",
-            "thanks": "You're welcome 😊",
-            "thank you": "You're welcome 😊",
+            "thanks": "You're welcome.",
+            "thank you": "You're welcome.",
             "nice": "Thanks for watching!",
             "awesome": "Thanks for watching!",
             "great": "Thanks for watching!",
@@ -528,27 +536,40 @@ class ReplyGenerator:
         self.default_reply = "Thank you for your support."
         self.sheet_rules: Dict[str, Dict[str, str]] = {}
         self.client = None
-        self._init_llm_client()
 
-    async def fetch_sheet_rules(self) -> None:
+    async def fetch_sheet_rules(self, sheet_url: Optional[str] = None) -> None:
         """Fetches the auto-reply rules CSV dynamically from the public Google Sheet."""
-        if not settings.GOOGLE_SHEET_RULES_URL:
-            logger.info("No GOOGLE_SHEET_RULES_URL configured. Using default local rules.")
+        self.sheet_rules = {}
+        raw_url = (sheet_url or settings.GOOGLE_SHEET_RULES_URL or "").strip()
+        if not raw_url:
+            logger.info("No Google Sheet rules URL configured. Using default local rules.")
             return
 
-        url = settings.GOOGLE_SHEET_RULES_URL
+        # Ensure settings is updated if sheet_url was passed explicitly
+        if sheet_url:
+            settings.GOOGLE_SHEET_RULES_URL = raw_url
+
+        url = raw_url
         gid = None
         if "gid=" in url:
             m = re.search(r"[?#&]gid=(\d+)", url)
             if m:
                 gid = m.group(1)
 
-        if "/edit" in url:
+        sheet_match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+        if sheet_match:
+            sheet_id = sheet_match.group(1)
+            export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+            if gid is not None:
+                export_url += f"&gid={gid}"
+            url = export_url
+        elif "/edit" in url:
             url = url.split("/edit")[0] + "/export?format=csv"
-            if gid:
+            if gid is not None:
                 url += f"&gid={gid}"
 
-        logger.info(f"Fetching latest auto-reply rules from Google Sheet: {url}")
+        logger.info("Connecting to Google Sheet to fetch auto-reply rules...")
+        logger.debug(f"Fetching export URL: {url}")
         try:
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                 response = await client.get(url)
@@ -563,14 +584,11 @@ class ReplyGenerator:
                     logger.warning("Google Sheet rules CSV is empty.")
                     return
 
-                # Debug: log first 3 raw rows to help diagnose parsing issues
+                # Debug: log first 3 raw rows
                 for i, row in enumerate(all_rows[:3]):
-                    logger.info(f"  CSV row {i+1}: {row}")
+                    logger.debug(f"  CSV row {i+1}: {row}")
 
                 # ── Auto-detect the real header row ───────────────────────────────
-                # Some sheets have a decorative title/banner row before the actual
-                # column headers. We scan up to the first 5 rows and pick the one
-                # that contains the most recognizable column-header keywords.
                 HEADER_KEYWORDS = {"url", "comment", "keyword", "reply", "message", "video", "title"}
                 header_row_idx = 0
                 best_score = 0
@@ -579,17 +597,17 @@ class ReplyGenerator:
                         1 for cell in row
                         if any(kw in cell.strip().lower() for kw in HEADER_KEYWORDS)
                     )
-                    logger.info(f"  Header-candidate row {i}: score={score}, cells={row[:4]}")
+                    logger.debug(f"  Header-candidate row {i}: score={score}, cells={row[:4]}")
                     if score > best_score:
                         best_score = score
                         header_row_idx = i
 
                 header = all_rows[header_row_idx]
                 data_rows = all_rows[header_row_idx + 1:]
-                logger.info(f"Using row {header_row_idx} as header: {header}")
+                logger.debug(f"Using row {header_row_idx} as header: {header}")
 
                 col_indices = {col.strip().lower(): idx for idx, col in enumerate(header)}
-                logger.info(f"Detected column indices: {col_indices}")
+                logger.debug(f"Detected column indices: {col_indices}")
 
                 video_idx = next(
                     (idx for name, idx in col_indices.items()
@@ -609,7 +627,7 @@ class ReplyGenerator:
                      or "reply" in name or "message" in name),
                     3
                 )
-                logger.info(f"Column mapping → video_idx={video_idx}, comment_idx={comment_idx}, reply_idx={reply_idx}")
+                logger.debug(f"Column mapping → video_idx={video_idx}, comment_idx={comment_idx}, reply_idx={reply_idx}")
 
                 rules = {}
                 for row in data_rows:
@@ -631,34 +649,13 @@ class ReplyGenerator:
                     rules[vid_id][user_comment] = reply_text
 
                 self.sheet_rules = rules
-                logger.info(f"Loaded rules for {len(rules)} videos from Google Sheet.")
+                logger.info(f"Loaded rules for {len(rules)} video(s) from Google Sheet: {list(rules.keys())}")
         except Exception as e:
             logger.error(f"Failed to fetch/parse Google Sheet rules: {str(e)}")
 
     def _init_llm_client(self):
-        provider = settings.LLM_PROVIDER.lower()
-        api_key = None
-        base_url = None
-
-        try:
-            if provider == "openai":
-                api_key = settings.OPENAI_API_KEY
-            elif provider == "groq":
-                api_key = settings.GROQ_API_KEY
-                base_url = "https://api.groq.com/openai/v1"
-            elif provider == "ollama":
-                api_key = "ollama"
-                base_url = settings.OLLAMA_API_URL
-                
-            if provider in ("openai", "groq") and not api_key:
-                logger.warning(f"{settings.LLM_PROVIDER.upper()} selected, but API key is missing. AI replies will fall back to predefined responses.")
-                return
-
-            self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-            logger.info(f"Initialized LLM client for provider: {provider} using model: {settings.LLM_MODEL}")
-        except Exception as e:
-            logger.error(f"Failed to initialize LLM client: {str(e)}")
-            self.client = None
+        # YouTube automation is strictly rule-based and keyword-driven with manual review; no LLM client is required
+        self.client = None
 
     def detect_sentiment_and_type(self, text: str) -> Tuple[str, bool, bool]:
         text_lower = text.lower()
@@ -687,54 +684,59 @@ class ReplyGenerator:
             
         return sentiment, is_question, is_offensive
 
-    def generate_predefined_reply(self, text: str, video_id: Optional[str] = None) -> str:
-        text_lower = text.lower()
+    def find_matching_keyword_reply(self, comment_text: str, video_id: Optional[str] = None) -> Optional[Tuple[str, str]]:
+        lower_text = comment_text.lower()
+
+        # Check video-specific rules from Google Sheet
         if video_id and video_id in self.sheet_rules:
-            for keyword, response in self.sheet_rules[video_id].items():
-                if keyword in text_lower:
-                    logger.info(f"Matched Google Sheet rule: Keyword '{keyword}' -> Reply '{response[:30]}...'")
-                    return response
-        
-        for keyword, response in self.predefined_keywords.items():
-            if keyword in text_lower:
-                logger.info(f"Matched default local rule: Keyword '{keyword}' -> Reply '{response[:30]}...'")
-                return response
-        return self.default_reply
+            for kw, reply_template in self.sheet_rules[video_id].items():
+                if kw in lower_text:
+                    return kw, reply_template
+
+        # Check global sheet rules
+        if "global" in self.sheet_rules:
+            for kw, reply_template in self.sheet_rules["global"].items():
+                if kw in lower_text:
+                    return kw, reply_template
+
+        # Check hardcoded fallback predefined keywords
+        for kw, reply_template in self.predefined_keywords.items():
+            if kw in lower_text:
+                return kw, reply_template
+
+        return None
+
+    def generate_predefined_reply(self, text: str, video_id: Optional[str] = None) -> str:
+        match = self.find_matching_keyword_reply(text, video_id)
+        if match:
+            return strip_emojis(match[1])
+        return strip_emojis(self.default_reply)
 
     async def generate_ai_reply(self, text: str, video_id: Optional[str] = None) -> str:
         if not self.client:
             return self.generate_predefined_reply(text, video_id)
 
-        system_prompt = (
-            "You are the owner of this YouTube channel.\n"
-            "Reply professionally and politely to the following comment.\n"
-            "Constraints:\n"
-            "- Maximum 1-2 lines. Keep it very short and concise.\n"
-            "- Never argue.\n"
-            "- Never use offensive language.\n"
-            "- Keep replies friendly and support-oriented.\n"
-            "- ALWAYS reply in English, regardless of the language used in the comment.\n"
-            "- Return ONLY the direct reply text, with no wrapping quotes, no introduction, and no extra text."
-        )
-
         try:
             response = await self.client.chat.completions.create(
                 model=settings.LLM_MODEL,
                 messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": text}
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a helpful YouTube creator replying to comments on your video.\n"
+                            "Keep replies concise, friendly, professional, and directly relevant to the comment.\n"
+                            "Never exceed 2 sentences. Do NOT include any emojis or emoticons under any circumstances."
+                        )
+                    },
+                    {"role": "user", "content": f"Comment: {text}"}
                 ],
-                max_tokens=100,
+                max_tokens=60,
                 temperature=0.7
             )
             reply = response.choices[0].message.content.strip()
-            if reply.startswith('"') and reply.endswith('"'):
-                reply = reply[1:-1].strip()
-            if reply.startswith("'") and reply.endswith("'"):
-                reply = reply[1:-1].strip()
-            return reply
+            return strip_emojis(reply)
         except Exception as e:
-            logger.error(f"Error during LLM reply generation: {str(e)}. Falling back to predefined reply.")
+            logger.error(f"Error during AI reply generation: {e}. Using fallback.")
             return self.generate_predefined_reply(text, video_id)
 
     def resolve_spintax(self, text: str) -> str:
@@ -762,18 +764,15 @@ class ReplyGenerator:
             elif r < 0.45:
                 if not reply.endswith(handle):
                     reply = f"{reply} {handle}"
-
-        emojis = ["😊", "👍", "🙌", "✨", "🎉", "❤️", "🔥", "💯", "🙏"]
-        if random.random() < 0.45 and not any(e in reply for e in emojis):
-            reply = f"{reply} {random.choice(emojis)}"
             
         if reply.endswith(".") and random.random() < 0.3:
             reply = reply[:-1] + "!"
-        return reply.strip()
+            
+        return strip_emojis(reply)
 
     async def rewrite_reply_with_llm(self, comment_text: str, reply_template: str) -> str:
         if not self.client:
-            return reply_template
+            return strip_emojis(reply_template)
 
         system_prompt = (
             "You are a YouTube channel owner replying to a comment.\n"
@@ -785,6 +784,7 @@ class ReplyGenerator:
             "- Do NOT output the template verbatim. Rephrase it uniquely.\n"
             "- Never say something like 'Thanks for the comment' unless the template implies it.\n"
             "- Do not include any HTML, quotes, or metadata in your output.\n"
+            "- Do NOT include any emojis or emoticons under any circumstances.\n"
             "- Return ONLY the rephrased reply text. Maximum 35 words."
         )
 
@@ -803,25 +803,20 @@ class ReplyGenerator:
                 reply = reply[1:-1].strip()
             if reply.startswith("'") and reply.endswith("'"):
                 reply = reply[1:-1].strip()
-            return reply
+            return strip_emojis(reply)
         except Exception as e:
             logger.error(f"Error rewriting reply with LLM: {str(e)}")
-            return reply_template
+            return strip_emojis(reply_template)
 
     async def humanize_static_reply(self, comment_text: str, reply_template: str, author_handle: str) -> str:
-        if settings.AUTO_REWRITE_REPLY and self.client:
-            logger.info("Auto-rewriting static reply with LLM...")
-            rewritten = await self.rewrite_reply_with_llm(comment_text, reply_template)
-            if rewritten and rewritten != reply_template:
-                return self.resolve_spintax(rewritten)
-        
-        logger.info("Applying rule-based humanization to static reply...")
-        return self.humanize_reply_rules(reply_template, author_handle)
+        return strip_emojis(self.humanize_reply_rules(reply_template, author_handle))
 
     async def generate_reply(self, text: str, mode: str = "predefined", video_id: Optional[str] = None) -> str:
         if mode == "ai":
-            return await self.generate_ai_reply(text, video_id)
-        return self.generate_predefined_reply(text, video_id)
+            res = await self.generate_ai_reply(text, video_id)
+        else:
+            res = self.generate_predefined_reply(text, video_id)
+        return strip_emojis(res)
 
 reply_generator = ReplyGenerator()
 
@@ -974,15 +969,8 @@ class YouTubeService:
         avatar = page.locator("button#avatar-btn, img#img[alt='Avatar image']")
         try:
             if await avatar.count() > 0:
-                logger.info("User is already signed in to YouTube.")
-                logger.info("Pausing for 25 seconds to allow you to switch accounts in the browser window if this is not the correct account...")
-                for remaining in range(25, 0, -5):
-                    logger.info(f"Continuing in {remaining} seconds...")
-                    await asyncio.sleep(5.0)
-                # Re-verify sign-in status after the wait
-                if await avatar.count() > 0:
-                    logger.info("Proceeding with the currently logged-in account.")
-                    return True
+                logger.info("User is already signed in to YouTube. Proceeding...")
+                return True
         except Exception:
             pass
 
@@ -1204,6 +1192,7 @@ class YouTubeService:
 
     async def post_reply(self, page: Page, thread: Locator, reply_text: str) -> bool:
         """Clicks Reply on a comment, types the reply text, and verifies submission."""
+        reply_text = strip_emojis(reply_text)
         max_retries = 3
 
         for attempt in range(1, max_retries + 1):
@@ -1355,15 +1344,14 @@ class YouTubeService:
                 await asyncio.sleep(2.0)
         return False
 
-    async def run_auto_reply(self) -> Dict[str, Any]:
+    async def run_auto_reply(self, sheet_url: Optional[str] = None) -> Dict[str, Any]:
         """Main orchestrator to process all videos and matching comments."""
         self.is_running = True
-        await reply_generator.fetch_sheet_rules()
+        await reply_generator.fetch_sheet_rules(sheet_url=sheet_url)
         if not reply_generator.sheet_rules:
             logger.warning("No keyword rules found in Google Sheet.")
 
         video_ids = list(reply_generator.sheet_rules.keys()) if reply_generator.sheet_rules else []
-        logger.info(f"Loaded rules for {len(video_ids)} video(s): {video_ids}")
 
         if not video_ids:
             logger.warning("Sheet rules are empty. No video URLs found in the Google sheet.")
@@ -1636,10 +1624,10 @@ class BotStatusResponse(BaseModel):
 # Router Group
 router = APIRouter(prefix="/youtube", tags=["YouTube Auto Reply"])
 
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, Body
 
 @router.post("/comment/start")
-async def start_bot(background_tasks: BackgroundTasks):
+async def start_bot(background_tasks: BackgroundTasks, request: Optional[dict] = Body(default=None)):
     """Triggers the YouTube Shorts comment auto-reply flow."""
     if youtube_service.is_running:
         raise HTTPException(
@@ -1647,11 +1635,28 @@ async def start_bot(background_tasks: BackgroundTasks):
             detail=f"The bot is already running a task on video: {youtube_service.current_video_id}"
         )
 
-    logger.info("Received auto-reply trigger. Reading rules from Google Sheet...")
+    sheet_url_override = None
+    if request and isinstance(request, dict):
+        req_settings = request.get("settings", request)
+        if isinstance(req_settings, dict):
+            raw_url = req_settings.get("google_sheet_rules_url") or req_settings.get("GOOGLE_SHEET_RULES_URL")
+            if raw_url:
+                sheet_url_override = str(raw_url).strip()
+                settings.GOOGLE_SHEET_RULES_URL = sheet_url_override
+            if "max_replies_per_run" in req_settings:
+                try:
+                    settings.MAX_REPLIES_PER_RUN = int(req_settings["max_replies_per_run"])
+                except (ValueError, TypeError):
+                    pass
+            if "headless" in req_settings:
+                settings.HEADLESS = str(req_settings["headless"]).strip().lower() in ("true", "1", "yes")
+
+    target_sheet_url = sheet_url_override or settings.GOOGLE_SHEET_RULES_URL
+    logger.info(f"Received auto-reply trigger. Using Google Sheet rules URL: {target_sheet_url}")
     
     async def run_task():
         try:
-            await youtube_service.run_auto_reply()
+            await youtube_service.run_auto_reply(sheet_url=target_sheet_url)
         except Exception as e:
             logger.error(f"Background bot execution failed: {e}")
 
@@ -1753,7 +1758,7 @@ async def clear_app_logs():
 
 @router.post("/config/save")
 async def save_config(request: dict):
-    """Save YouTube bot configuration to the project .env file."""
+    """Save YouTube bot configuration to the project .env file and apply immediately."""
     env_path = settings.BASE_DIR / ".env"
     
     # Map friendly keys to env var names
@@ -1770,10 +1775,33 @@ async def save_config(request: dict):
     
     updates = {}
     req_settings = request.get("settings", request)  # support both wrapped and raw
-    for k, v in req_settings.items():
-        env_key = key_map.get(k, k.upper())
-        updates[env_key] = str(v)
+    if isinstance(req_settings, dict):
+        for k, v in req_settings.items():
+            env_key = key_map.get(k, k.upper())
+            updates[env_key] = str(v)
     
+    # Update active in-memory settings immediately
+    if "GOOGLE_SHEET_RULES_URL" in updates:
+        settings.GOOGLE_SHEET_RULES_URL = updates["GOOGLE_SHEET_RULES_URL"].strip()
+        reply_generator.sheet_rules.clear()
+    if "OPENAI_API_KEY" in updates:
+        settings.OPENAI_API_KEY = updates["OPENAI_API_KEY"].strip()
+    if "GROQ_API_KEY" in updates:
+        settings.GROQ_API_KEY = updates["GROQ_API_KEY"].strip()
+    if "LLM_PROVIDER" in updates:
+        settings.LLM_PROVIDER = updates["LLM_PROVIDER"].strip()
+    if "LLM_MODEL" in updates:
+        settings.LLM_MODEL = updates["LLM_MODEL"].strip()
+    if "HEADLESS" in updates:
+        settings.HEADLESS = str(updates["HEADLESS"]).strip().lower() in ("true", "1", "yes")
+    if "MAX_REPLIES_PER_RUN" in updates:
+        try:
+            settings.MAX_REPLIES_PER_RUN = int(updates["MAX_REPLIES_PER_RUN"])
+        except (ValueError, TypeError):
+            pass
+    if "CHROME_PROFILE_PATH" in updates:
+        settings.CHROME_PROFILE_PATH = updates["CHROME_PROFILE_PATH"].strip()
+
     lines = []
     existing_keys: set = set()
     if env_path.exists():
@@ -1797,7 +1825,10 @@ async def save_config(request: dict):
     try:
         with open(env_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
-        return {"status": "success", "message": "YouTube configuration saved"}
+            
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_path, override=True)
+        return {"status": "success", "message": "YouTube configuration saved and applied"}
     except Exception as e:
         logger.error(f"Failed to save YouTube config: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

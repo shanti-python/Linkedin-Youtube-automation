@@ -7,14 +7,22 @@ from youtube_reply_bot.app.config import settings
 from youtube_reply_bot.app.utils.logger import logger
 from youtube_reply_bot.app.utils.helpers import extract_video_id
 
+def strip_emojis(text: str) -> str:
+    """Removes emoji characters and symbols from comment replies to keep comments professional."""
+    if not text:
+        return ""
+    clean = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf\ufe00-\ufe0f]', '', text)
+    return re.sub(r' +', ' ', clean).strip()
+
+
 class ReplyGenerator:
     def __init__(self):
         self.predefined_keywords = {
             "guide": "Thank you! I'll make a detailed guide soon.",
             "tutorial": "Thank you! I'll make a detailed guide soon.",
             "python": "Python tutorial is coming soon.",
-            "thanks": "You're welcome 😊",
-            "thank you": "You're welcome 😊",
+            "thanks": "You're welcome.",
+            "thank you": "You're welcome.",
             "nice": "Thanks for watching!",
             "awesome": "Thanks for watching!",
             "great": "Thanks for watching!",
@@ -26,25 +34,35 @@ class ReplyGenerator:
 
         # Setup client based on provider
         self.client = None
-        self._init_llm_client()
 
-    async def fetch_sheet_rules(self) -> None:
+    async def fetch_sheet_rules(self, sheet_url: Optional[str] = None) -> None:
         """Fetches the auto-reply rules CSV dynamically from the public Google Sheet."""
-        if not settings.GOOGLE_SHEET_RULES_URL:
-            logger.info("No GOOGLE_SHEET_RULES_URL configured. Using default local rules.")
+        self.sheet_rules = {}
+        raw_url = (sheet_url or settings.GOOGLE_SHEET_RULES_URL or "").strip()
+        if not raw_url:
+            logger.info("No Google Sheet rules URL configured. Using default local rules.")
             return
 
-        # Convert Google Sheet URL to direct CSV export URL
-        url = settings.GOOGLE_SHEET_RULES_URL
+        if sheet_url:
+            settings.GOOGLE_SHEET_RULES_URL = raw_url
+
+        url = raw_url
         gid = None
         if "gid=" in url:
             m = re.search(r"[?#&]gid=(\d+)", url)
             if m:
                 gid = m.group(1)
 
-        if "/edit" in url:
+        sheet_match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+        if sheet_match:
+            sheet_id = sheet_match.group(1)
+            export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+            if gid is not None:
+                export_url += f"&gid={gid}"
+            url = export_url
+        elif "/edit" in url:
             url = url.split("/edit")[0] + "/export?format=csv"
-            if gid:
+            if gid is not None:
                 url += f"&gid={gid}"
 
         logger.info(f"Fetching latest auto-reply rules from Google Sheet: {url}")
@@ -96,31 +114,8 @@ class ReplyGenerator:
             logger.error(f"Failed to fetch/parse Google Sheet rules: {str(e)}")
 
     def _init_llm_client(self):
-        """Initializes the OpenAI-compatible client based on the provider settings."""
-        provider = settings.LLM_PROVIDER.lower()
-        api_key = None
-        base_url = None
-
-        try:
-            if provider == "openai":
-                api_key = settings.OPENAI_API_KEY
-                # Uses default OpenAI endpoint
-            elif provider == "groq":
-                api_key = settings.GROQ_API_KEY
-                base_url = "https://api.groq.com/openai/v1"
-            elif provider == "ollama":
-                api_key = "ollama"  # Ollama doesn't require a real API key
-                base_url = settings.OLLAMA_API_URL
-                
-            if provider in ("openai", "groq") and not api_key:
-                logger.warning(f"{settings.LLM_PROVIDER.upper()} selected, but API key is missing. AI replies will fall back to predefined responses.")
-                return
-
-            self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-            logger.info(f"Initialized LLM client for provider: {provider} using model: {settings.LLM_MODEL}")
-        except Exception as e:
-            logger.error(f"Failed to initialize LLM client: {str(e)}")
-            self.client = None
+        # YouTube automation is strictly rule-based and keyword-driven with manual review; no LLM client is required
+        self.client = None
 
     def detect_sentiment_and_type(self, text: str) -> Tuple[str, bool, bool]:
         """
@@ -249,12 +244,12 @@ class ReplyGenerator:
         if reply.endswith(".") and random.random() < 0.3:
             reply = reply[:-1] + "!"
 
-        return reply.strip()
+        return strip_emojis(reply)
 
     async def rewrite_reply_with_llm(self, comment_text: str, reply_template: str) -> str:
         """Uses LLM to rewrite/rephrase the reply to sound like a human response to the comment."""
         if not self.client:
-            return reply_template
+            return strip_emojis(reply_template)
 
         system_prompt = (
             "You are a YouTube channel owner replying to a comment.\n"
@@ -266,6 +261,7 @@ class ReplyGenerator:
             "- Do NOT output the template verbatim. Rephrase it uniquely.\n"
             "- Never say something like 'Thanks for the comment' unless the template implies it.\n"
             "- Do not include any HTML, quotes, or metadata in your output.\n"
+            "- Do NOT include any emojis or emoticons under any circumstances.\n"
             "- Return ONLY the rephrased reply text. Maximum 35 words."
         )
 
@@ -284,28 +280,22 @@ class ReplyGenerator:
                 reply = reply[1:-1].strip()
             if reply.startswith("'") and reply.endswith("'"):
                 reply = reply[1:-1].strip()
-            return reply
+            return strip_emojis(reply)
         except Exception as e:
             logger.error(f"Error rewriting reply with LLM: {str(e)}")
-            return reply_template
+            return strip_emojis(reply_template)
 
     async def humanize_static_reply(self, comment_text: str, reply_template: str, author_handle: str) -> str:
         """Orchestrates humanization of a static/predefined reply template."""
-        if settings.AUTO_REWRITE_REPLY and self.client:
-            logger.info("Auto-rewriting static reply with LLM...")
-            rewritten = await self.rewrite_reply_with_llm(comment_text, reply_template)
-            if rewritten and rewritten != reply_template:
-                return self.resolve_spintax(rewritten)
-        
-        # Rule-based fallback
-        logger.info("Applying rule-based humanization to static reply...")
-        return self.humanize_reply_rules(reply_template, author_handle)
+        return strip_emojis(self.humanize_reply_rules(reply_template, author_handle))
 
     async def generate_reply(self, text: str, mode: str = "predefined", video_id: Optional[str] = None) -> str:
         """Wrapper method to generate replies based on the selected mode."""
         if mode == "ai":
-            return await self.generate_ai_reply(text, video_id)
-        return self.generate_predefined_reply(text, video_id)
+            res = await self.generate_ai_reply(text, video_id)
+        else:
+            res = self.generate_predefined_reply(text, video_id)
+        return strip_emojis(res)
 
 # Global instance of ReplyGenerator
 reply_generator = ReplyGenerator()
