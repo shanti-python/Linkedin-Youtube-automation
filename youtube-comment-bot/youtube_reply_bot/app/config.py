@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     # Limits
     MAX_REPLIES_PER_RUN: int = 50
     
+    # Schedule & Automation config
+    START_TIME: Optional[str] = "07:00 PM IST"
+    TIMEZONE: str = "Asia/Kolkata"
+    CHECK_INTERVAL_MINUTES: int = 15
+    CHECK_DURATION_HOURS: float = 4.0
+    SCHEDULE_ENABLED: bool = True
+    TARGET_VIDEO_URL: Optional[str] = None
+
     # Google Sheets (Optional)
     GOOGLE_SHEET_ID: Optional[str] = None
     GOOGLE_SHEET_CREDENTIALS_FILE: Optional[str] = None

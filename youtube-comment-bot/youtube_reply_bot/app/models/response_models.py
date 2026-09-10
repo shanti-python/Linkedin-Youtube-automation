@@ -20,6 +20,13 @@ class ReplyResponse(BaseModel):
 
 class BotStatusResponse(BaseModel):
     is_running: bool = Field(False, description="Whether the bot is currently running an automation task")
+    is_scheduled_running: bool = Field(False, description="Whether scheduled monitoring is active")
+    is_waiting_for_schedule: bool = Field(False, description="Whether bot is waiting for upload start time")
+    schedule_status: str = Field("idle", description="Current schedule state: 'idle', 'waiting', 'monitoring'")
+    next_run_timestamp: Optional[str] = Field(None, description="Next run or check timestamp")
+    time_until_start: Optional[str] = Field(None, description="Countdown until next scheduled run")
+    current_cycle: int = Field(0, description="Current check cycle number")
+    schedule_config: Optional[Dict[str, Any]] = Field(None, description="Active schedule configuration summary")
     current_video_id: Optional[str] = Field(None, description="Video ID being processed, if any")
     total_runs: int = Field(0, description="Total runs performed")
     last_run_timestamp: Optional[str] = Field(None, description="Timestamp of the last run completion")

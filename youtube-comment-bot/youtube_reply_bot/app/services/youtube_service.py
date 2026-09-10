@@ -132,10 +132,18 @@ SELECTORS = {
 class YouTubeService:
     def __init__(self):
         self.is_running = False
+        self.is_scheduled_running = False
+        self.is_waiting_for_schedule = False
+        self.schedule_status = "idle"  # idle, waiting, monitoring
+        self.next_run_timestamp = None
+        self.time_until_start = None
+        self.current_cycle = 0
+        self.should_stop = False
         self.current_video_id = None
         self.total_runs = 0
         self.last_run_timestamp = None
         self.last_run_statistics = {}
+        self._account_checked = False
 
     # ─── Helpers ──────────────────────────────────
 
@@ -1072,6 +1080,149 @@ class YouTubeService:
             self.is_running = False
             self.current_video_id = None
             await browser_manager.close_browser()
+
+    def stop_monitor(self) -> None:
+        """Signals the scheduled monitor or active run to stop gracefully."""
+        logger.info("Stop requested for YouTube Comment Bot.")
+        self.should_stop = True
+        self.is_running = False
+        self.is_scheduled_running = False
+        self.is_waiting_for_schedule = False
+        self.schedule_status = "idle"
+
+    async def run_scheduled_monitor(self, sheet_url: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Schedules and executes recurring comment checking after START_TIME (e.g. 07:00 PM IST).
+        Monitors for new comments during the post-upload window (CHECK_DURATION_HOURS),
+        checking periodically every CHECK_INTERVAL_MINUTES.
+        If SCHEDULE_ENABLED is False, skips scheduling entirely and runs normal auto-reply.
+        """
+        if not settings.SCHEDULE_ENABLED:
+            logger.info("[Scheduler] SCHEDULE_ENABLED is False. Scheduling and bot execution are disabled. Exiting.")
+            return {"status": "disabled", "message": "SCHEDULE_ENABLED is False in config. Bot will not run."}
+
+        from youtube_reply_bot.app.utils.scheduler import (
+            parse_schedule_time,
+            calculate_schedule,
+            format_countdown,
+            wait_until_target,
+        )
+        from datetime import datetime, timedelta
+
+        start_time_str = settings.START_TIME or "07:00 PM IST"
+        default_tz = settings.TIMEZONE or "Asia/Kolkata"
+        duration_hours = float(settings.CHECK_DURATION_HOURS if settings.CHECK_DURATION_HOURS is not None else 4.0)
+        interval_minutes = int(settings.CHECK_INTERVAL_MINUTES or 15)
+
+        start_t, tz = parse_schedule_time(start_time_str, default_tz)
+        logger.info(
+            f"[Scheduler] Initializing YouTube comment monitoring. "
+            f"Configured Start Time: {start_t.strftime('%I:%M %p')} {tz.key} | "
+            f"Interval: {interval_minutes}m | Duration: {duration_hours}h"
+        )
+
+        self.is_scheduled_running = True
+        self.should_stop = False
+        self.current_cycle = 0
+
+        try:
+            while not self.should_stop:
+                now = datetime.now(tz)
+                state, target_dt, remaining_sec = calculate_schedule(now, start_t, duration_hours)
+
+                if state in ("WAIT_TODAY", "WAIT_TOMORROW"):
+                    self.schedule_status = "waiting"
+                    self.is_waiting_for_schedule = True
+                    self.next_run_timestamp = target_dt.isoformat()
+                    self.time_until_start = format_countdown(remaining_sec)
+
+                    logger.info(
+                        f"[Scheduler] Waiting until upload check time: {target_dt.strftime('%I:%M %p %Z on %Y-%m-%d')}. "
+                        f"Countdown: {self.time_until_start}."
+                    )
+
+                    reached = await wait_until_target(
+                        target_dt=target_dt,
+                        tz=tz,
+                        cancel_checker=lambda: self.should_stop,
+                        logger=logger,
+                        label="Post-Upload Comment Monitor"
+                    )
+                    if not reached or self.should_stop:
+                        logger.info("[Scheduler] Wait interrupted / stopped by user.")
+                        break
+
+                    # Target reached, recalculate
+                    now = datetime.now(tz)
+                    state, target_dt, remaining_sec = calculate_schedule(now, start_t, duration_hours)
+
+                if state == "ACTIVE_WINDOW":
+                    self.schedule_status = "monitoring"
+                    self.is_waiting_for_schedule = False
+                    logger.info(
+                        f"[Scheduler] ACTIVE POST-UPLOAD MONITORING WINDOW! "
+                        f"Window remaining: {format_countdown(remaining_sec)}."
+                    )
+
+                    while not self.should_stop:
+                        now = datetime.now(tz)
+                        check_state, _, win_remaining = calculate_schedule(now, start_t, duration_hours)
+                        if check_state != "ACTIVE_WINDOW":
+                            logger.info("[Scheduler] Active post-upload window has ended for today.")
+                            break
+
+                        self.current_cycle += 1
+                        logger.info(
+                            f"=== Starting Scheduled Check Cycle #{self.current_cycle} at "
+                            f"{now.strftime('%I:%M:%S %p %Z')} ==="
+                        )
+
+                        cycle_result = await self.run_auto_reply(sheet_url=sheet_url)
+                        logger.info(
+                            f"[Scheduler] Cycle #{self.current_cycle} complete. "
+                            f"Replied: {cycle_result.get('replied', 0)}, "
+                            f"Skipped/Logged: {cycle_result.get('skipped', 0)}."
+                        )
+
+                        if self.should_stop:
+                            break
+
+                        next_check_dt = datetime.now(tz) + timedelta(minutes=interval_minutes)
+                        self.next_run_timestamp = next_check_dt.isoformat()
+                        logger.info(
+                            f"[Scheduler] Next check cycle #{self.current_cycle + 1} scheduled at "
+                            f"{next_check_dt.strftime('%I:%M:%S %p %Z')} (in {interval_minutes} minutes)..."
+                        )
+
+                        reached = await wait_until_target(
+                            target_dt=next_check_dt,
+                            tz=tz,
+                            cancel_checker=lambda: self.should_stop,
+                            logger=logger,
+                            label=f"Cycle #{self.current_cycle + 1}"
+                        )
+                        if not reached or self.should_stop:
+                            break
+
+                if self.should_stop:
+                    break
+
+                # If duration completed, wait before looking for next day
+                logger.info("[Scheduler] Monitoring window complete for today. Awaiting next scheduled run...")
+                await asyncio.sleep(60)
+
+        except Exception as e:
+            logger.error(f"[Scheduler] Fatal error in scheduled monitor: {e}")
+            return {"status": "error", "message": str(e)}
+        finally:
+            self.is_scheduled_running = False
+            self.is_waiting_for_schedule = False
+            self.schedule_status = "idle"
+            self.next_run_timestamp = None
+            self.time_until_start = None
+            logger.info("[Scheduler] Scheduled monitor stopped.")
+
+        return {"status": "stopped", "cycles_completed": self.current_cycle}
 
 
 # Global instance

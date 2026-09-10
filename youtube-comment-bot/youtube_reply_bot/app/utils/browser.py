@@ -7,7 +7,10 @@ os.environ.pop("WAYLAND_DISPLAY", None)
 
 from typing import Tuple
 from playwright.async_api import async_playwright, Playwright, BrowserContext, Page
-from playwright_stealth import Stealth
+try:
+    from playwright_stealth import Stealth
+except ImportError:
+    Stealth = None
 from youtube_reply_bot.app.config import settings
 from youtube_reply_bot.app.utils.logger import logger
 
@@ -16,7 +19,7 @@ class BrowserManager:
         self.playwright: Playwright = None
         self.context: BrowserContext = None
         self.page: Page = None
-        self.stealth = Stealth()
+        self.stealth = Stealth() if Stealth else None
 
     async def open_browser(self) -> Tuple[BrowserContext, Page]:
         """Launches Chromium using a persistent browser context."""
@@ -73,7 +76,11 @@ class BrowserManager:
         else:
             self.page = await self.context.new_page()
             
-        await self.stealth.apply_stealth_async(self.page)
+        if self.stealth:
+            try:
+                await self.stealth.apply_stealth_async(self.page)
+            except Exception:
+                pass
         
         # Avoid webdriver property detection and apply comprehensive stealth shims
         await self.page.add_init_script("""

@@ -20,7 +20,8 @@ import random
 import math
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, time
+import zoneinfo
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set, Tuple
 from urllib.parse import urlparse, parse_qs
@@ -68,6 +69,14 @@ class Settings(BaseSettings):
     # Limits
     MAX_REPLIES_PER_RUN: int = 50
     
+    # Schedule & Automation config
+    START_TIME: Optional[str] = "07:00 PM IST"
+    TIMEZONE: str = "Asia/Kolkata"
+    CHECK_INTERVAL_MINUTES: int = 15
+    CHECK_DURATION_HOURS: float = 4.0
+    SCHEDULE_ENABLED: bool = True
+    TARGET_VIDEO_URL: Optional[str] = None
+
     # Google Sheets (Optional)
     GOOGLE_SHEET_ID: Optional[str] = None
     GOOGLE_SHEET_CREDENTIALS_FILE: Optional[str] = None
@@ -170,6 +179,142 @@ def extract_video_id(url: str) -> Optional[str]:
         return url
         
     return None
+
+
+def parse_schedule_time(time_str: str, default_tz_name: str = "Asia/Kolkata") -> Tuple[time, zoneinfo.ZoneInfo]:
+    """Parses a 12-hour or 24-hour time string with optional timezone (e.g. '07:00 PM IST')."""
+    if not time_str or not isinstance(time_str, str):
+        return time(19, 0, 0), zoneinfo.ZoneInfo(default_tz_name)
+
+    time_str = time_str.strip()
+    tz_name = default_tz_name
+
+    tz_match = re.search(r'\b(IST|UTC|EST|EDT|CST|CDT|PST|PDT|GMT)\b', time_str, re.IGNORECASE)
+    if tz_match:
+        tz_abbr = tz_match.group(1).upper()
+        if tz_abbr == "IST":
+            tz_name = "Asia/Kolkata"
+        elif tz_abbr in ("UTC", "GMT"):
+            tz_name = "UTC"
+        elif tz_abbr in ("EST", "EDT"):
+            tz_name = "America/New_York"
+        elif tz_abbr in ("CST", "CDT"):
+            tz_name = "America/Chicago"
+        elif tz_abbr in ("PST", "PDT"):
+            tz_name = "America/Los_Angeles"
+        time_str = re.sub(r'\b(IST|UTC|EST|EDT|CST|CDT|PST|PDT|GMT)\b', '', time_str, flags=re.IGNORECASE).strip()
+
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = zoneinfo.ZoneInfo("Asia/Kolkata")
+
+    match_12 = re.match(r'^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)$', time_str, re.IGNORECASE)
+    if match_12:
+        hr = int(match_12.group(1))
+        minute = int(match_12.group(2))
+        sec = int(match_12.group(3) or 0)
+        ampm = match_12.group(4).upper()
+        if ampm == "PM" and hr < 12:
+            hr += 12
+        elif ampm == "AM" and hr == 12:
+            hr = 0
+        return time(hr, minute, sec), tz
+
+    match_24 = re.match(r'^(\d{1,2}):(\d{2})(?::(\d{2}))?$', time_str)
+    if match_24:
+        hr = int(match_24.group(1))
+        minute = int(match_24.group(2))
+        sec = int(match_24.group(3) or 0)
+        return time(hr, minute, sec), tz
+
+    return time(19, 0, 0), tz
+
+
+def calculate_schedule(
+    current_dt: datetime,
+    start_t: time,
+    duration_hours: float = 4.0
+) -> Tuple[str, datetime, float]:
+    """Calculates schedule state: 'WAIT_TODAY', 'ACTIVE_WINDOW', or 'WAIT_TOMORROW'."""
+    start_today = current_dt.replace(
+        hour=start_t.hour,
+        minute=start_t.minute,
+        second=start_t.second,
+        microsecond=0
+    )
+
+    if duration_hours <= 0:
+        window_end_today = start_today + timedelta(days=1)
+    else:
+        window_end_today = start_today + timedelta(hours=duration_hours)
+
+    if current_dt < start_today:
+        wait_seconds = (start_today - current_dt).total_seconds()
+        return "WAIT_TODAY", start_today, wait_seconds
+    elif current_dt <= window_end_today:
+        remaining_window = (window_end_today - current_dt).total_seconds()
+        return "ACTIVE_WINDOW", start_today, remaining_window
+    else:
+        start_tomorrow = start_today + timedelta(days=1)
+        wait_seconds = (start_tomorrow - current_dt).total_seconds()
+        return "WAIT_TOMORROW", start_tomorrow, wait_seconds
+
+
+def format_countdown(seconds: float) -> str:
+    """Formats seconds into '2h 15m 30s'."""
+    total_sec = max(0, int(seconds))
+    hours, remainder = divmod(total_sec, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    elif minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+async def wait_until_target(
+    target_dt: datetime,
+    tz: zoneinfo.ZoneInfo,
+    cancel_checker: Optional[Any] = None,
+    logger=None,
+    label: str = "Scheduled comment checking"
+) -> bool:
+    """Waits asynchronously until target_dt while checking cancellation."""
+    last_logged_minute = -1
+
+    while True:
+        if cancel_checker and cancel_checker():
+            if logger:
+                logger.info(f"{label} wait cancelled.")
+            return False
+
+        now = datetime.now(tz)
+        diff = (target_dt - now).total_seconds()
+        if diff <= 0:
+            if logger:
+                logger.info(f"Target time reached ({target_dt.strftime('%I:%M:%S %p %Z')}). Starting {label}!")
+            return True
+
+        current_minute = int(diff // 60)
+        should_log = False
+        if current_minute != last_logged_minute:
+            if diff > 3600 and current_minute % 30 == 0:
+                should_log = True
+            elif 300 < diff <= 3600 and current_minute % 5 == 0:
+                should_log = True
+            elif diff <= 300:
+                should_log = True
+
+        if should_log and logger:
+            logger.info(
+                f"[Scheduler] {label} set for {target_dt.strftime('%I:%M %p %Z')}. "
+                f"Time remaining: {format_countdown(diff)}."
+            )
+            last_logged_minute = current_minute
+
+        sleep_chunk = min(2.0, max(0.2, diff))
+        await asyncio.sleep(sleep_chunk)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -902,10 +1047,18 @@ SELECTORS = {
 class YouTubeService:
     def __init__(self):
         self.is_running = False
+        self.is_scheduled_running = False
+        self.is_waiting_for_schedule = False
+        self.schedule_status = "idle"  # idle, waiting, monitoring
+        self.next_run_timestamp = None
+        self.time_until_start = None
+        self.current_cycle = 0
+        self.should_stop = False
         self.current_video_id = None
         self.total_runs = 0
         self.last_run_timestamp = None
         self.last_run_statistics = {}
+        self._account_checked = False
 
     async def _find_locator(self, parent: Any, selector_keys: List[str]) -> Optional[Locator]:
         for selector in selector_keys:
@@ -1563,6 +1716,139 @@ class YouTubeService:
             self.current_video_id = None
             await browser_manager.close_browser()
 
+    def stop_monitor(self) -> None:
+        """Signals the scheduled monitor or active run to stop gracefully."""
+        logger.info("Stop requested for YouTube Comment Bot.")
+        self.should_stop = True
+        self.is_running = False
+        self.is_scheduled_running = False
+        self.is_waiting_for_schedule = False
+        self.schedule_status = "idle"
+
+    async def run_scheduled_monitor(self, sheet_url: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Schedules and executes recurring comment checking after START_TIME (e.g. 07:00 PM IST).
+        Monitors for new comments during the post-upload window (CHECK_DURATION_HOURS),
+        checking periodically every CHECK_INTERVAL_MINUTES.
+        If SCHEDULE_ENABLED is False, skips scheduling entirely and runs normal auto-reply.
+        """
+        if not settings.SCHEDULE_ENABLED:
+            logger.info("[Scheduler] SCHEDULE_ENABLED is False. Scheduling and bot execution are disabled. Exiting.")
+            return {"status": "disabled", "message": "SCHEDULE_ENABLED is False in config. Bot will not run."}
+
+        start_time_str = settings.START_TIME or "07:00 PM IST"
+        default_tz = settings.TIMEZONE or "Asia/Kolkata"
+        duration_hours = float(settings.CHECK_DURATION_HOURS if settings.CHECK_DURATION_HOURS is not None else 4.0)
+        interval_minutes = int(settings.CHECK_INTERVAL_MINUTES or 15)
+
+        start_t, tz = parse_schedule_time(start_time_str, default_tz)
+        logger.info(
+            f"[Scheduler] Initializing YouTube comment monitoring. "
+            f"Configured Start Time: {start_t.strftime('%I:%M %p')} {tz.key} | "
+            f"Interval: {interval_minutes}m | Duration: {duration_hours}h"
+        )
+
+        self.is_scheduled_running = True
+        self.should_stop = False
+        self.current_cycle = 0
+
+        try:
+            while not self.should_stop:
+                now = datetime.now(tz)
+                state, target_dt, remaining_sec = calculate_schedule(now, start_t, duration_hours)
+
+                if state in ("WAIT_TODAY", "WAIT_TOMORROW"):
+                    self.schedule_status = "waiting"
+                    self.is_waiting_for_schedule = True
+                    self.next_run_timestamp = target_dt.isoformat()
+                    self.time_until_start = format_countdown(remaining_sec)
+
+                    logger.info(
+                        f"[Scheduler] Waiting until upload check time: {target_dt.strftime('%I:%M %p %Z on %Y-%m-%d')}. "
+                        f"Countdown: {self.time_until_start}."
+                    )
+
+                    reached = await wait_until_target(
+                        target_dt=target_dt,
+                        tz=tz,
+                        cancel_checker=lambda: self.should_stop,
+                        logger=logger,
+                        label="Post-Upload Comment Monitor"
+                    )
+                    if not reached or self.should_stop:
+                        logger.info("[Scheduler] Wait interrupted / stopped by user.")
+                        break
+
+                    now = datetime.now(tz)
+                    state, target_dt, remaining_sec = calculate_schedule(now, start_t, duration_hours)
+
+                if state == "ACTIVE_WINDOW":
+                    self.schedule_status = "monitoring"
+                    self.is_waiting_for_schedule = False
+                    logger.info(
+                        f"[Scheduler] ACTIVE POST-UPLOAD MONITORING WINDOW! "
+                        f"Window remaining: {format_countdown(remaining_sec)}."
+                    )
+
+                    while not self.should_stop:
+                        now = datetime.now(tz)
+                        check_state, _, win_remaining = calculate_schedule(now, start_t, duration_hours)
+                        if check_state != "ACTIVE_WINDOW":
+                            logger.info("[Scheduler] Active post-upload window has ended for today.")
+                            break
+
+                        self.current_cycle += 1
+                        logger.info(
+                            f"=== Starting Scheduled Check Cycle #{self.current_cycle} at "
+                            f"{now.strftime('%I:%M:%S %p %Z')} ==="
+                        )
+
+                        cycle_result = await self.run_auto_reply(sheet_url=sheet_url)
+                        logger.info(
+                            f"[Scheduler] Cycle #{self.current_cycle} complete. "
+                            f"Replied: {cycle_result.get('replied', 0)}, "
+                            f"Skipped/Logged: {cycle_result.get('skipped', 0)}."
+                        )
+
+                        if self.should_stop:
+                            break
+
+                        next_check_dt = datetime.now(tz) + timedelta(minutes=interval_minutes)
+                        self.next_run_timestamp = next_check_dt.isoformat()
+                        logger.info(
+                            f"[Scheduler] Next check cycle #{self.current_cycle + 1} scheduled at "
+                            f"{next_check_dt.strftime('%I:%M:%S %p %Z')} (in {interval_minutes} minutes)..."
+                        )
+
+                        reached = await wait_until_target(
+                            target_dt=next_check_dt,
+                            tz=tz,
+                            cancel_checker=lambda: self.should_stop,
+                            logger=logger,
+                            label=f"Cycle #{self.current_cycle + 1}"
+                        )
+                        if not reached or self.should_stop:
+                            break
+
+                if self.should_stop:
+                    break
+
+                logger.info("[Scheduler] Monitoring window complete for today. Awaiting next scheduled run...")
+                await asyncio.sleep(60)
+
+        except Exception as e:
+            logger.error(f"[Scheduler] Fatal error in scheduled monitor: {e}")
+            return {"status": "error", "message": str(e)}
+        finally:
+            self.is_scheduled_running = False
+            self.is_waiting_for_schedule = False
+            self.schedule_status = "idle"
+            self.next_run_timestamp = None
+            self.time_until_start = None
+            logger.info("[Scheduler] Scheduled monitor stopped.")
+
+        return {"status": "stopped", "cycles_completed": self.current_cycle}
+
 youtube_service = YouTubeService()
 
 
@@ -1615,6 +1901,13 @@ class ReplyResponse(BaseModel):
 class BotStatusResponse(BaseModel):
     status: str
     is_processing: bool
+    is_scheduled_running: bool = False
+    is_waiting_for_schedule: bool = False
+    schedule_status: str = "idle"
+    next_run_timestamp: Optional[str] = None
+    time_until_start: Optional[str] = None
+    current_cycle: int = 0
+    schedule_config: Optional[Dict[str, Any]] = None
     current_post_url: Optional[str] = None
     processed_today: int = 0
     max_replies_per_day: int = 0
@@ -1628,14 +1921,16 @@ from fastapi import BackgroundTasks, Body
 
 @router.post("/comment/start")
 async def start_bot(background_tasks: BackgroundTasks, request: Optional[dict] = Body(default=None)):
-    """Triggers the YouTube Shorts comment auto-reply flow."""
-    if youtube_service.is_running:
+    """Triggers the YouTube Shorts comment auto-reply flow (supports scheduled and immediate modes)."""
+    if youtube_service.is_running or youtube_service.is_scheduled_running:
         raise HTTPException(
             status_code=409,
             detail=f"The bot is already running a task on video: {youtube_service.current_video_id}"
         )
 
     sheet_url_override = None
+    mode = "scheduled" if settings.SCHEDULE_ENABLED else "now"
+
     if request and isinstance(request, dict):
         req_settings = request.get("settings", request)
         if isinstance(req_settings, dict):
@@ -1650,37 +1945,81 @@ async def start_bot(background_tasks: BackgroundTasks, request: Optional[dict] =
                     pass
             if "headless" in req_settings:
                 settings.HEADLESS = str(req_settings["headless"]).strip().lower() in ("true", "1", "yes")
+            if "start_time" in req_settings:
+                settings.START_TIME = str(req_settings["start_time"]).strip()
+            if "check_interval_minutes" in req_settings:
+                try:
+                    settings.CHECK_INTERVAL_MINUTES = int(req_settings["check_interval_minutes"])
+                except (ValueError, TypeError):
+                    pass
+            if "check_duration_hours" in req_settings:
+                try:
+                    settings.CHECK_DURATION_HOURS = float(req_settings["check_duration_hours"])
+                except (ValueError, TypeError):
+                    pass
+            if "schedule_enabled" in req_settings:
+                settings.SCHEDULE_ENABLED = str(req_settings["schedule_enabled"]).strip().lower() in ("true", "1", "yes")
+            if "mode" in req_settings:
+                mode = str(req_settings["mode"]).strip().lower()
+
+    if not settings.SCHEDULE_ENABLED:
+        mode = "now"
 
     target_sheet_url = sheet_url_override or settings.GOOGLE_SHEET_RULES_URL
-    logger.info(f"Received auto-reply trigger. Using Google Sheet rules URL: {target_sheet_url}")
+    logger.info(f"Received YouTube bot start trigger. Mode: {mode}, Rules URL: {target_sheet_url}")
     
     async def run_task():
         try:
-            await youtube_service.run_auto_reply(sheet_url=target_sheet_url)
+            if mode == "scheduled":
+                await youtube_service.run_scheduled_monitor(sheet_url=target_sheet_url)
+            else:
+                await youtube_service.run_auto_reply(sheet_url=target_sheet_url)
         except Exception as e:
             logger.error(f"Background bot execution failed: {e}")
 
     background_tasks.add_task(run_task)
-    return {"status": "starting", "message": "Bot background execution started"}
+    return {
+        "status": "starting",
+        "mode": mode,
+        "message": f"Bot background execution started in {mode} mode."
+    }
 
 @router.post("/comment/stop")
 async def stop_bot():
-    """Request stopping the current run."""
-    if not youtube_service.is_running:
+    """Request stopping the current run or active schedule."""
+    if not youtube_service.is_running and not youtube_service.is_scheduled_running:
         return {"status": "idle", "message": "Bot is not running"}
-    youtube_service.is_running = False
+    youtube_service.stop_monitor()
     return {"status": "stopping", "message": "Stop command sent"}
 
 @router.get("/comment/status", response_model=BotStatusResponse)
 async def get_bot_status():
-    """Returns the current operational status and statistics of the bot."""
+    """Returns the current operational status, schedule details, and statistics of the bot."""
     replied_today = 0
     if youtube_service.last_run_statistics:
         replied_today = youtube_service.last_run_statistics.get("replied", 0)
         
+    is_active = youtube_service.is_running or youtube_service.is_scheduled_running
+    status_str = "processing" if is_active else "idle"
+    if youtube_service.is_waiting_for_schedule:
+        status_str = "waiting_for_schedule"
+
     return BotStatusResponse(
-        status="processing" if youtube_service.is_running else "idle",
-        is_processing=youtube_service.is_running,
+        status=status_str,
+        is_processing=is_active,
+        is_scheduled_running=youtube_service.is_scheduled_running,
+        is_waiting_for_schedule=youtube_service.is_waiting_for_schedule,
+        schedule_status=youtube_service.schedule_status,
+        next_run_timestamp=youtube_service.next_run_timestamp,
+        time_until_start=youtube_service.time_until_start,
+        current_cycle=youtube_service.current_cycle,
+        schedule_config={
+            "start_time": settings.START_TIME,
+            "timezone": settings.TIMEZONE,
+            "check_interval_minutes": settings.CHECK_INTERVAL_MINUTES,
+            "check_duration_hours": settings.CHECK_DURATION_HOURS,
+            "schedule_enabled": settings.SCHEDULE_ENABLED,
+        },
         current_post_url=youtube_service.current_video_id,
         processed_today=replied_today,
         max_replies_per_day=settings.MAX_REPLIES_PER_RUN,
@@ -1694,6 +2033,11 @@ async def get_bot_status():
             "max_replies_per_run": settings.MAX_REPLIES_PER_RUN,
             "google_sheet_rules_url": settings.GOOGLE_SHEET_RULES_URL or "",
             "chrome_profile_path": settings.CHROME_PROFILE_PATH or "",
+            "start_time": settings.START_TIME or "07:00 PM IST",
+            "timezone": settings.TIMEZONE or "Asia/Kolkata",
+            "check_interval_minutes": settings.CHECK_INTERVAL_MINUTES or 15,
+            "check_duration_hours": settings.CHECK_DURATION_HOURS or 4.0,
+            "schedule_enabled": settings.SCHEDULE_ENABLED,
         }
     )
 
@@ -1771,6 +2115,11 @@ async def save_config(request: dict):
         "max_replies_per_run": "MAX_REPLIES_PER_RUN",
         "google_sheet_rules_url": "GOOGLE_SHEET_RULES_URL",
         "chrome_profile_path": "CHROME_PROFILE_PATH",
+        "start_time": "START_TIME",
+        "timezone": "TIMEZONE",
+        "check_interval_minutes": "CHECK_INTERVAL_MINUTES",
+        "check_duration_hours": "CHECK_DURATION_HOURS",
+        "schedule_enabled": "SCHEDULE_ENABLED",
     }
     
     updates = {}
@@ -1801,6 +2150,22 @@ async def save_config(request: dict):
             pass
     if "CHROME_PROFILE_PATH" in updates:
         settings.CHROME_PROFILE_PATH = updates["CHROME_PROFILE_PATH"].strip()
+    if "START_TIME" in updates:
+        settings.START_TIME = updates["START_TIME"].strip()
+    if "TIMEZONE" in updates:
+        settings.TIMEZONE = updates["TIMEZONE"].strip()
+    if "CHECK_INTERVAL_MINUTES" in updates:
+        try:
+            settings.CHECK_INTERVAL_MINUTES = int(updates["CHECK_INTERVAL_MINUTES"])
+        except (ValueError, TypeError):
+            pass
+    if "CHECK_DURATION_HOURS" in updates:
+        try:
+            settings.CHECK_DURATION_HOURS = float(updates["CHECK_DURATION_HOURS"])
+        except (ValueError, TypeError):
+            pass
+    if "SCHEDULE_ENABLED" in updates:
+        settings.SCHEDULE_ENABLED = str(updates["SCHEDULE_ENABLED"]).strip().lower() in ("true", "1", "yes")
 
     lines = []
     existing_keys: set = set()
@@ -1849,17 +2214,42 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="YouTube Auto Reply Bot")
     parser.add_argument("--server", action="store_true", help="Run as FastAPI server")
     parser.add_argument("--port", type=int, default=8000, help="Port for the FastAPI server")
+    parser.add_argument("--schedule", action="store_true", help="Run in scheduled monitoring mode (waits for START_TIME e.g. 07:00 PM IST)")
+    parser.add_argument("--now", action="store_true", help="Force immediate single check pass, bypassing schedule")
+    parser.add_argument("--limit", type=int, default=None, help="Max replies to post in this run (e.g. 1)")
     args = parser.parse_args()
-    
+
+    if args.limit is not None:
+        settings.MAX_REPLIES_PER_RUN = args.limit
+        logger.info(f"Max replies limit set to: {settings.MAX_REPLIES_PER_RUN}")
+
     if args.server:
         logger.info(f"Starting Uvicorn server on http://127.0.0.1:{args.port}")
         uvicorn.run(app, host="127.0.0.1", port=args.port)
-    else:
-        logger.info("Starting YouTube Comment Auto Reply Bot flow directly...")
+    elif not settings.SCHEDULE_ENABLED and not args.now:
+        logger.info("[Bot] SCHEDULE_ENABLED is False in .env. Bot execution is disabled. Exiting.")
+        sys.exit(0)
+    elif args.now:
+        logger.info(f"Executing immediate single-pass auto-reply run (--now requested, max {settings.MAX_REPLIES_PER_RUN} reply)...")
         try:
             result = asyncio.run(youtube_service.run_auto_reply())
             logger.info("Auto-reply execution finished.")
             print(json.dumps(result, indent=2))
         except Exception as e:
             logger.error(f"Fatal error during execution: {e}")
+            sys.exit(1)
+    elif settings.SCHEDULE_ENABLED:
+        logger.info(
+            f"Starting YouTube Scheduled Comment Monitor (Start Time: {settings.START_TIME}, "
+            f"Interval: {settings.CHECK_INTERVAL_MINUTES}m, Window: {settings.CHECK_DURATION_HOURS}h, "
+            f"Limit: {settings.MAX_REPLIES_PER_RUN})..."
+        )
+        try:
+            result = asyncio.run(youtube_service.run_scheduled_monitor())
+            logger.info("Scheduled monitor finished.")
+            print(json.dumps(result, indent=2))
+        except KeyboardInterrupt:
+            logger.info("Bot interrupted by user (Ctrl+C). Exiting.")
+        except Exception as e:
+            logger.error(f"Fatal error during scheduled execution: {e}")
             sys.exit(1)

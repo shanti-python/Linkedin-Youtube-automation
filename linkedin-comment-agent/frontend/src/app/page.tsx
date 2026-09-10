@@ -26,8 +26,15 @@ interface CSVLogEntry {
 }
 
 interface StatusData {
-  status: "idle" | "processing";
+  status: "idle" | "processing" | "waiting_for_schedule" | string;
   is_processing: boolean;
+  is_scheduled_running?: boolean;
+  is_waiting_for_schedule?: boolean;
+  schedule_status?: "idle" | "waiting" | "monitoring" | string;
+  next_run_timestamp?: string | null;
+  time_until_start?: string | null;
+  current_cycle?: number;
+  schedule_config?: Record<string, any>;
   current_post_url: string | null;
   processed_today: number;
   max_replies_per_day: number;
@@ -306,18 +313,19 @@ export default function Home() {
   }, [csvLogs, dateFilter, accountFilter, postFilter, searchQuery]);
 
   // Unified Run Controls
-  const handleStartBot = async () => {
+  const handleStartBot = async (mode: "scheduled" | "now" = "scheduled") => {
     setIsStartingBot(true);
     try {
       const apiUrl = getApiUrl();
+      const payloadSettings = { ...configSettings, mode };
 
-      // Persist current settings (such as Google Sheet Rules URL) to backend before starting
+      // Persist current settings to backend before starting
       if (Object.keys(configSettings).length > 0) {
         try {
           await fetch(`${apiUrl}/${platform}/config/save`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ settings: configSettings }),
+            body: JSON.stringify({ settings: payloadSettings }),
           });
         } catch (saveErr) {
           console.warn("Could not pre-save settings before starting bot:", saveErr);
@@ -327,10 +335,19 @@ export default function Home() {
       const res = await fetch(`${apiUrl}/${platform}/comment/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ settings: configSettings }),
+        body: JSON.stringify({ settings: payloadSettings }),
       });
       if (res.ok) {
-        showToast("Bot automation started successfully!", "success");
+        if (platform === "youtube") {
+          showToast(
+            mode === "now"
+              ? "Immediate comment check cycle started!"
+              : `Scheduled monitoring started! (Checking after ${configSettings.start_time || "07:00 PM IST"})`,
+            "success"
+          );
+        } else {
+          showToast("Bot automation started successfully!", "success");
+        }
         fetchData();
       } else {
         const errData = await res.json().catch(() => ({}));
@@ -593,6 +610,51 @@ export default function Home() {
                 </div>
               </div>
 
+              {/* YOUTUBE SCHEDULE MONITOR STATUS BANNER */}
+              {platform === "youtube" && (
+                <div className={`p-4 rounded-xl border transition-all ${
+                  status?.is_waiting_for_schedule || status?.schedule_status === "waiting"
+                    ? "bg-amber-500/10 border-amber-500/30 text-amber-300"
+                    : status?.schedule_status === "monitoring"
+                    ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
+                    : "bg-[#151824] border-slate-800/80 text-slate-400"
+                }`}>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-3">
+                      <div className={`w-3 h-3 rounded-full ${
+                        status?.is_waiting_for_schedule || status?.schedule_status === "waiting"
+                          ? "bg-amber-400 animate-ping"
+                          : status?.schedule_status === "monitoring"
+                          ? "bg-emerald-400 animate-pulse"
+                          : "bg-slate-600"
+                      }`} />
+                      <div>
+                        <span className="text-xs font-bold uppercase tracking-wider block">
+                          {status?.is_waiting_for_schedule || status?.schedule_status === "waiting"
+                            ? "Scheduled Wait Active"
+                            : status?.schedule_status === "monitoring"
+                            ? `Active Post-Upload Monitoring (Cycle #${status?.current_cycle || 1})`
+                            : "Scheduled Comment Monitor Standby"}
+                        </span>
+                        <p className="text-[11px] opacity-80 mt-0.5">
+                          {status?.is_waiting_for_schedule || status?.schedule_status === "waiting"
+                            ? `Waiting until ${configSettings.start_time || "07:00 PM IST"} to start checking comments. Remaining: ${status?.time_until_start || "calculating..."}.`
+                            : status?.schedule_status === "monitoring"
+                            ? `Checking comments every ${configSettings.check_interval_minutes || 15} minutes for ${configSettings.check_duration_hours || 4} hours after upload.`
+                            : `Configured to start checking after ${configSettings.start_time || "07:00 PM IST"} (every ${configSettings.check_interval_minutes || 15}m). Click Start Scheduled Monitor to engage.`}
+                        </p>
+                      </div>
+                    </div>
+                    {status?.next_run_timestamp && (
+                      <div className="text-right text-[11px] bg-black/20 px-3 py-1.5 rounded-lg border border-white/5 font-mono">
+                        <span className="text-slate-400 block text-[9px] uppercase">Next Check At</span>
+                        {new Date(status.next_run_timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* TOP STATS CARDS GRID */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
 
@@ -774,29 +836,103 @@ export default function Home() {
                         />
                         <p className="text-[10px] text-slate-500 mt-1">Public Google Sheet CSV with keyword→reply rules for YouTube Shorts.</p>
                       </div>
+
+                      {/* Scheduled Monitoring Section */}
+                      <div className="border-t border-slate-800/80 pt-4 mt-2">
+                        <h4 className="text-xs font-bold text-red-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                          Post-Upload Schedule & Periodic Comment Monitor
+                        </h4>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                          <div>
+                            <label className="text-xs font-bold text-slate-400 block mb-1">Upload Start Time (IST)</label>
+                            <input
+                              type="text"
+                              value={configSettings.start_time ?? "07:00 PM IST"}
+                              onChange={(e) => handleConfigChange("start_time", e.target.value)}
+                              placeholder="07:00 PM IST"
+                              className="w-full text-xs bg-[#0b0c13] text-white border border-slate-800 focus:border-red-500 rounded-lg p-3 outline-none transition-colors font-mono"
+                            />
+                            <p className="text-[10px] text-slate-500 mt-1">e.g. "07:00 PM IST", "19:00", "7:00 PM"</p>
+                          </div>
+                          <div>
+                            <label className="text-xs font-bold text-slate-400 block mb-1">Check Interval (Minutes)</label>
+                            <input
+                              type="number"
+                              value={configSettings.check_interval_minutes ?? 15}
+                              onChange={(e) => handleConfigChange("check_interval_minutes", parseInt(e.target.value) || 15)}
+                              min={1} max={180}
+                              className="w-full text-xs bg-[#0b0c13] text-white border border-slate-800 focus:border-red-500 rounded-lg p-3 outline-none transition-colors"
+                            />
+                            <p className="text-[10px] text-slate-500 mt-1">Re-check for new comments every X minutes</p>
+                          </div>
+                          <div>
+                            <label className="text-xs font-bold text-slate-400 block mb-1">Monitoring Window (Hours)</label>
+                            <input
+                              type="number"
+                              step="0.5"
+                              value={configSettings.check_duration_hours ?? 4.0}
+                              onChange={(e) => handleConfigChange("check_duration_hours", parseFloat(e.target.value) || 4.0)}
+                              min={0.5} max={24}
+                              className="w-full text-xs bg-[#0b0c13] text-white border border-slate-800 focus:border-red-500 rounded-lg p-3 outline-none transition-colors"
+                            />
+                            <p className="text-[10px] text-slate-500 mt-1">Total hours to monitor post-upload (e.g. 4 hrs)</p>
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   )}
 
                   {/* Action buttons - Start Bot Automation & Save Settings */}
-                  <div className="flex justify-between items-center pt-2 gap-4 border-t border-slate-800/60 mt-4">
-                    <div>
+                  <div className="flex flex-wrap justify-between items-center pt-2 gap-4 border-t border-slate-800/60 mt-4">
+                    <div className="flex flex-wrap items-center gap-3">
                       {status?.is_processing ? (
                         <button
                           type="button"
                           onClick={handleStopBot}
-                          className="py-2.5 px-6 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-lg transition-all shadow-md shadow-rose-600/20 active:scale-95 cursor-pointer"
+                          className="py-2.5 px-6 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-lg transition-all shadow-md shadow-rose-600/20 active:scale-95 cursor-pointer flex items-center gap-2"
                         >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                          </svg>
                           Stop Bot Automation
                         </button>
                       ) : (
-                        <button
-                          type="button"
-                          onClick={handleStartBot}
-                          disabled={!isApiConnected || isStartingBot}
-                          className="py-2.5 px-6 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-600/30 text-white font-bold text-xs rounded-lg transition-all shadow-md shadow-emerald-600/20 active:scale-95 cursor-pointer"
-                        >
-                          {isStartingBot ? "Starting Bot..." : "Start Bot Automation"}
-                        </button>
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => handleStartBot("scheduled")}
+                            disabled={!isApiConnected || isStartingBot}
+                            className={`py-2.5 px-6 font-bold text-xs rounded-lg transition-all shadow-md active:scale-95 cursor-pointer flex items-center gap-2 text-white ${
+                              platform === "youtube"
+                                ? "bg-red-600 hover:bg-red-700 disabled:bg-red-600/30 shadow-red-600/20"
+                                : "bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-600/30 shadow-emerald-600/20"
+                            }`}
+                          >
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                            {isStartingBot
+                              ? "Starting..."
+                              : platform === "youtube"
+                                ? `Start Scheduled Monitor (${configSettings.start_time || "07:00 PM IST"})`
+                                : "Start Bot Automation"}
+                          </button>
+
+                          {platform === "youtube" && (
+                            <button
+                              type="button"
+                              onClick={() => handleStartBot("now")}
+                              disabled={!isApiConnected || isStartingBot}
+                              className="py-2.5 px-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 disabled:opacity-40 text-slate-200 font-semibold text-xs rounded-lg transition-all cursor-pointer"
+                              title="Run an immediate single comment check cycle right now without waiting for the scheduled time"
+                            >
+                              Run Immediate Check Now
+                            </button>
+                          )}
+                        </>
                       )}
                     </div>
 
